@@ -41,6 +41,10 @@ impl YnabServer {
         &self.client
     }
 
+    pub(crate) fn writes_allowed(&self) -> bool {
+        self.allow_writes
+    }
+
     async fn month_cache(&self) -> Result<&MonthCache, McpError> {
         self.month_cache
             .get_or_try_init(|| async {
@@ -79,10 +83,11 @@ impl YnabServer {
     pub fn new(client: Client, journal: Journal, allow_writes: bool, meta: ServerMeta) -> Self {
         let mut tool_router = Self::read_router()
             + Self::analytics_router()
+            + Self::transfer_router()
             + Self::history_router()
             + Self::diag_router();
         if allow_writes {
-            tool_router += Self::write_router();
+            tool_router += Self::write_router() + Self::transfer_write_router();
         }
         Self {
             client: Arc::new(client),
@@ -95,7 +100,7 @@ impl YnabServer {
     }
 }
 
-fn client_name(ctx: &RequestContext<RoleServer>) -> Option<String> {
+pub(crate) fn client_name(ctx: &RequestContext<RoleServer>) -> Option<String> {
     let name = ctx
         .peer
         .peer_info()
@@ -192,7 +197,7 @@ pub struct ReconcileArgs {
     pub window_days: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct NewTransactionArg {
     /// Account id from list_accounts.
     pub account_id: String,
@@ -430,11 +435,46 @@ impl YnabServer {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let summary = self
+            .reconcile_rows(&args.account_id, &bank_rows, window_days)
+            .await?;
+        json_result(&summary)
+    }
+}
+
+/// Reconcile outcome plus the bank rows that were missing, for callers that go on to create them.
+pub(crate) struct ReconcileOutcome {
+    pub summary: serde_json::Value,
+    pub missing: Vec<BankRow>,
+}
+
+impl YnabServer {
+    pub(crate) async fn reconcile_rows(
+        &self,
+        account_id: &str,
+        bank_rows: &[BankRow],
+        window_days: i64,
+    ) -> Result<serde_json::Value, McpError> {
+        Ok(self
+            .reconcile_full(account_id, bank_rows, window_days)
+            .await?
+            .summary)
+    }
+
+    pub(crate) async fn reconcile_full(
+        &self,
+        account_id: &str,
+        bank_rows: &[BankRow],
+        window_days: i64,
+    ) -> Result<ReconcileOutcome, McpError> {
+        if bank_rows.is_empty() {
+            return Err(invalid("no bank rows"));
+        }
         let lo = bank_rows.iter().map(|r| r.date).min().expect("non-empty");
         let hi = bank_rows.iter().map(|r| r.date).max().expect("non-empty");
         let window = chrono::Duration::days(window_days);
         let filter = TransactionFilter {
-            account_id: Some(args.account_id),
+            account_id: Some(account_id.to_string()),
             since_date: Some((lo - window).to_string()),
             until_date: Some((hi + window).to_string()),
             ..Default::default()
@@ -461,8 +501,8 @@ impl YnabServer {
             })
             .collect::<Result<Vec<_>, McpError>>()?;
 
-        let result = reconcile::reconcile(&bank_rows, &ynab_rows, window_days);
-        json_result(&json!({
+        let result = reconcile::reconcile(bank_rows, &ynab_rows, window_days);
+        let summary = json!({
             "window_days": window_days,
             "bank_rows": bank_rows.len(),
             "ynab_rows_in_range": ynab_rows.len(),
@@ -477,7 +517,11 @@ impl YnabServer {
                     "day_offset": m.day_offset,
                 }))
                 .collect::<Vec<_>>(),
-        }))
+        });
+        Ok(ReconcileOutcome {
+            summary,
+            missing: result.missing_in_ynab,
+        })
     }
 }
 
@@ -568,12 +612,32 @@ impl YnabServer {
         Parameters(args): Parameters<CreateTransactionsArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        if args.transactions.is_empty() {
+        let summary = self
+            .create_rows(&args.transactions, "create_transactions", client_name(&ctx))
+            .await?;
+        json_result(&summary)
+    }
+}
+
+impl YnabServer {
+    /// The one write path: dedupe import ids, unapproved rows, journaled batch. Shared by
+    /// create_transactions and the CSV import.
+    pub(crate) async fn create_rows(
+        &self,
+        rows: &[NewTransactionArg],
+        tool: &str,
+        client: Option<String>,
+    ) -> Result<serde_json::Value, McpError> {
+        if !self.allow_writes {
+            return Err(invalid(
+                "writes are disabled on this server (YNAB_MCP_ALLOW_WRITES)",
+            ));
+        }
+        if rows.is_empty() {
             return Err(invalid("transactions is empty"));
         }
         let mut occurrences: std::collections::HashMap<(i64, String), u32> = Default::default();
-        let saves: Vec<SaveTransaction> = args
-            .transactions
+        let saves: Vec<SaveTransaction> = rows
             .iter()
             .map(|t| {
                 reconcile::parse_date(&t.date)
@@ -632,8 +696,8 @@ impl YnabServer {
                 batch_id: journal::new_batch_id(),
                 at: journal::now(),
                 plan_id: self.client.plan_id().to_string(),
-                tool: "create_transactions".to_string(),
-                client: client_name(&ctx),
+                tool: tool.to_string(),
+                client: client.clone(),
                 ops,
             };
             if let Err(e) = locked.append(&Record::Batch(partial)) {
@@ -656,8 +720,8 @@ impl YnabServer {
             batch_id: journal::new_batch_id(),
             at: journal::now(),
             plan_id: self.client.plan_id().to_string(),
-            tool: "create_transactions".to_string(),
-            client: client_name(&ctx),
+            tool: tool.to_string(),
+            client,
             ops,
         };
         if let Err(e) = locked.append(&Record::Batch(batch.clone())) {
@@ -672,7 +736,7 @@ impl YnabServer {
                 None,
             ));
         }
-        json_result(&json!({
+        Ok(json!({
             "batch_id": batch.batch_id,
             "created": result.transaction_ids.len(),
             "transaction_ids": result.transaction_ids,

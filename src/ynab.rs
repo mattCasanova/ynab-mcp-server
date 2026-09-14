@@ -406,6 +406,18 @@ impl Client {
         Ok(data.scheduled_transactions)
     }
 
+    /// Same as pressing Import on every linked account. Returns the imported transaction ids.
+    pub async fn import_linked_transactions(&self) -> Result<Vec<String>, YnabError> {
+        #[derive(Deserialize)]
+        struct ImportData {
+            transaction_ids: Vec<String>,
+        }
+        let data: ImportData = self
+            .send(self.http.post(self.plan_url("/transactions/import")))
+            .await?;
+        Ok(data.transaction_ids)
+    }
+
     pub async fn delete_transaction(&self, transaction_id: &str) -> Result<(), YnabError> {
         let url = self.plan_url(&format!("/transactions/{transaction_id}"));
         let _: serde_json::Value = self.send(self.http.delete(url)).await?;

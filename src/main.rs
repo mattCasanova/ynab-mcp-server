@@ -2,6 +2,7 @@ mod analytics;
 mod analytics_tools;
 mod cache;
 mod config;
+mod csvio;
 mod diag;
 mod journal;
 mod money;
@@ -10,6 +11,7 @@ mod reconcile;
 mod secrets;
 mod server;
 mod setup;
+mod transfer_tools;
 mod ynab;
 
 use std::path::Path;

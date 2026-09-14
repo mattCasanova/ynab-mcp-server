@@ -24,6 +24,9 @@ Plan and use cases: `~/workspace/ynab/ynab-mcp-plan.md`.
 | `budget_vs_actual` | one month: overspent, spent over target, assigned-but-unused, targets underfunded |
 | `goal_analysis` | every target over N months: assigned vs spent per month, months over target, money moved in/out and from where |
 | `money_movements` | category-to-category moves with names and per-category net |
+| `export_transactions` | CSV or JSON to a path; filter by dates, account, category, or category group; splits one row per leg |
+| `import_bank_csv` | one or more bank CSV files → parse by column mapping → dedupe across files → reconcile; `confirm` creates the missing rows (writes) |
+| `trigger_bank_import` | **write, gated.** YNAB's Import button for linked accounts |
 | `list_write_history` | every write batch any agent has made, with status open / partially_undone / undone |
 | `diagnostic_report` | redacted local diagnostics + a prefilled GitHub issue link; sends nothing |
 | `create_transactions` | **write, gated** by `YNAB_MCP_ALLOW_WRITES=1`; dedupe `import_id`, lands unapproved, journaled |
@@ -125,6 +128,20 @@ phases:
 2. With `confirm=true` the deletable rows are deleted. Flagged `reconciled` / `changed` rows
    are skipped unless `force=true`. `missing` rows are recorded as resolved. A batch stays
    open until every row is deleted or missing, so re-running is safe.
+
+## Files in and out
+
+- **Export** writes exactly the rows you ask for to the path you give, and refuses to overwrite
+  unless told to. The category-group filter is the tax-ledger case: every leg in the business
+  group for a date range, one row per leg, with the group and category on each row.
+- **Import** takes one or more CSV files from the same bank format. You (or the agent) read the
+  header and pass a column mapping: a date column, a description column, and either one signed
+  amount column or debit/credit columns. Dates parse as ISO, MM/DD/YYYY, MM/DD/YY, or a
+  strftime pattern you supply. Overlapping files are deduped and the duplicates reported. Then
+  it reconciles against the account. With writes enabled and `confirm=true`, the rows missing
+  in YNAB are created through the same journaled path as `create_transactions`, so they land
+  unapproved and can be undone.
+- The server reads only the paths it is given and writes only the export path it is given.
 
 ## Month cache
 
