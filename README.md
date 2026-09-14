@@ -27,11 +27,13 @@ Amounts are decimal strings in the plan currency; outflows are negative.
 ## Install
 
 Prebuilt binaries for macOS (Apple Silicon and Intel), Linux x86_64, and Windows x86_64 are the
-plan, with a one-line installer. Until the first GitHub Release exists, build from source:
+plan, with a one-line installer. With Rust installed:
 
 ```
-cargo install --git https://github.com/mattCasanova/ynab-mcp
+cargo install ynab-mcp-server
 ```
+
+The crate is `ynab-mcp-server` (the shorter name was taken); the binary is `ynab-mcp`.
 
 ## Setup
 

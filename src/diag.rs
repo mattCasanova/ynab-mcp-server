@@ -16,7 +16,7 @@ use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::Subs
 
 use crate::paths;
 
-pub const ISSUES_URL: &str = "https://github.com/mattCasanova/ynab-mcp/issues/new";
+pub const ISSUES_URL: &str = "https://github.com/mattCasanova/ynab-mcp-server/issues/new";
 const REPORT_LOG_LINES: usize = 40;
 const MAX_URL_BODY: usize = 6000;
 

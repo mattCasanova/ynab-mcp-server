@@ -1,9 +1,21 @@
 [package]
-name = "ynab-mcp"
+name = "ynab-mcp-server"
 version = "0.1.0"
 edition = "2024"
-description = "MCP server for YNAB: read-only by construction, one gated write tool"
+rust-version = "1.89"
+description = "MCP server for YNAB: read-only by construction, journaled two-phase undo for the one write tool, no telemetry"
 license = "MIT"
+repository = "https://github.com/mattCasanova/ynab-mcp-server"
+homepage = "https://github.com/mattCasanova/ynab-mcp-server"
+readme = "README.md"
+keywords = ["ynab", "mcp", "budget", "claude", "model-context-protocol"]
+categories = ["command-line-utilities", "finance"]
+exclude = [".github/", "*.jsonl"]
+
+# The crate is ynab-mcp-server on crates.io (ynab-mcp was already taken); the binary stays ynab-mcp.
+[[bin]]
+name = "ynab-mcp"
+path = "src/main.rs"
 
 [dependencies]
 rmcp = { version = "3.3", features = ["server", "macros", "transport-io", "schemars"] }
