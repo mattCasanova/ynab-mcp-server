@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/mattCasanova/ynab-mcp-server"
 homepage = "https://github.com/mattCasanova/ynab-mcp-server"
 readme = "README.md"
-keywords = ["ynab", "mcp", "budget", "claude", "model-context-protocol"]
+keywords = ["ynab", "mcp", "budget", "claude", "finance"]
 categories = ["command-line-utilities", "finance"]
 exclude = [".github/", "*.jsonl"]
 
