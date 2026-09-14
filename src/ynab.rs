@@ -132,7 +132,24 @@ pub struct SubTransaction {
     pub amount: Milliunits,
     pub memo: Option<String>,
     pub payee_name: Option<String>,
+    pub category_id: Option<String>,
     pub category_name: Option<String>,
+    pub transfer_account_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MoneyMovement {
+    pub month: String,
+    pub moved_at: Option<String>,
+    pub note: Option<String>,
+    pub from_category_id: Option<String>,
+    pub to_category_id: Option<String>,
+    pub amount: Milliunits,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoneyMovementsData {
+    money_movements: Vec<MoneyMovement>,
 }
 
 /// Covers both TransactionDetail and HybridTransaction (category/payee endpoints).
@@ -331,6 +348,12 @@ impl Client {
     pub async fn category_groups(&self) -> Result<Vec<CategoryGroup>, YnabError> {
         let data: CategoriesData = self.get(self.plan_url("/categories"), &[]).await?;
         Ok(data.category_groups)
+    }
+
+    /// Every money movement in the plan; the API has no date filter, callers filter by month.
+    pub async fn money_movements(&self) -> Result<Vec<MoneyMovement>, YnabError> {
+        let data: MoneyMovementsData = self.get(self.plan_url("/money_movements"), &[]).await?;
+        Ok(data.money_movements)
     }
 
     pub async fn month(&self, month: &str) -> Result<MonthDetail, YnabError> {

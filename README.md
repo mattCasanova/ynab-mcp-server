@@ -17,12 +17,28 @@ Plan and use cases: `~/workspace/ynab/ynab-mcp-plan.md`.
 | `list_transactions` | by account, category, date range, or `kind` = `uncategorized` / `unapproved` |
 | `list_scheduled_transactions` | upcoming recurring transactions |
 | `reconcile_account` | bank rows in → matched / missing in YNAB / in YNAB but not at the bank |
+| `spending_summary` | category × month actuals for N months, with average and recent-vs-earlier change |
+| `recurring_charges` | payees on a cadence: occurrences, first vs latest amount, drift, possibly lapsed |
+| `category_history` | one category by payee: total, count, share, monthly series |
+| `payee_summary` | payees ranked by outflow; frequency spend that hides in category totals |
+| `budget_vs_actual` | one month: overspent, spent over target, assigned-but-unused, targets underfunded |
+| `goal_analysis` | every target over N months: assigned vs spent per month, months over target, money moved in/out and from where |
+| `money_movements` | category-to-category moves with names and per-category net |
 | `list_write_history` | every write batch any agent has made, with status open / partially_undone / undone |
 | `diagnostic_report` | redacted local diagnostics + a prefilled GitHub issue link; sends nothing |
 | `create_transactions` | **write, gated** by `YNAB_MCP_ALLOW_WRITES=1`; dedupe `import_id`, lands unapproved, journaled |
 | `undo_batch`, `undo_last` | **write, gated.** Two-phase: preview first, then `confirm=true`. Flagged rows also need `force` |
 
 Amounts are decimal strings in the plan currency; outflows are negative.
+
+### The line
+
+The server counts; the model judges. The analytics tools return tables and counts, never a
+score, a label, or a recommendation. "Wasteful" is a judgment about your life, and it belongs in
+the conversation with your context, not in a heuristic someone else wrote. What the server does
+is make the budget meeting possible: twelve months summed correctly, subscriptions found by
+cadence, the money you moved out of Groceries three of the last six months laid out as fact.
+Then you, your partner, and the model talk about it.
 
 ## Install
 

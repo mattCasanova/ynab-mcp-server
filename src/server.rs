@@ -32,8 +32,15 @@ pub struct YnabServer {
 }
 
 impl YnabServer {
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
+
     pub fn new(client: Client, journal: Journal, allow_writes: bool, meta: ServerMeta) -> Self {
-        let mut tool_router = Self::read_router() + Self::history_router() + Self::diag_router();
+        let mut tool_router = Self::read_router()
+            + Self::analytics_router()
+            + Self::history_router()
+            + Self::diag_router();
         if allow_writes {
             tool_router += Self::write_router();
         }
@@ -65,13 +72,13 @@ fn journal_error(e: anyhow::Error) -> McpError {
     McpError::internal_error(format!("journal: {e:#}"), None)
 }
 
-fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
+pub(crate) fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string(value)
         .map_err(|e| McpError::internal_error(format!("serialize: {e}"), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
-fn api_error(e: YnabError) -> McpError {
+pub(crate) fn api_error(e: YnabError) -> McpError {
     tracing::error!(error = %e, "YNAB call failed");
     match e {
         YnabError::Api { status: 429, .. } => {
@@ -81,7 +88,7 @@ fn api_error(e: YnabError) -> McpError {
     }
 }
 
-fn invalid(msg: impl Into<String>) -> McpError {
+pub(crate) fn invalid(msg: impl Into<String>) -> McpError {
     let msg = msg.into();
     tracing::warn!(msg, "rejected tool arguments");
     McpError::invalid_params(msg, None)

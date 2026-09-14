@@ -1,3 +1,5 @@
+mod analytics;
+mod analytics_tools;
 mod config;
 mod diag;
 mod journal;
