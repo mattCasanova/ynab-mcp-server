@@ -18,34 +18,74 @@ Plan and use cases: `~/workspace/ynab/ynab-mcp-plan.md`.
 | `list_scheduled_transactions` | upcoming recurring transactions |
 | `reconcile_account` | bank rows in → matched / missing in YNAB / in YNAB but not at the bank |
 | `list_write_history` | every write batch any agent has made, with status open / partially_undone / undone |
+| `diagnostic_report` | redacted local diagnostics + a prefilled GitHub issue link; sends nothing |
 | `create_transactions` | **write, gated** by `YNAB_MCP_ALLOW_WRITES=1`; dedupe `import_id`, lands unapproved, journaled |
 | `undo_batch`, `undo_last` | **write, gated.** Two-phase: preview first, then `confirm=true`. Flagged rows also need `force` |
 
 Amounts are decimal strings in the plan currency; outflows are negative.
 
+## Install
+
+Prebuilt binaries for macOS (Apple Silicon and Intel), Linux x86_64, and Windows x86_64 are the
+plan, with a one-line installer. Until the first GitHub Release exists, build from source:
+
+```
+cargo install --git https://github.com/mattCasanova/ynab-mcp
+```
+
 ## Setup
 
-1. Create a Personal Access Token: YNAB → Account Settings → Developer Settings.
-2. Put it in the macOS Keychain (paste it into Dashlane too):
+One command. It asks for your token, checks it against YNAB, lets you pick a plan, stores the
+token in the OS secret store, writes the config, and prints the Claude Code registration line.
 
-   ```
-   security add-generic-password -a "$USER" -s ynab-mcp -w
-   ```
+```
+ynab-mcp setup
+```
 
-3. Build:
+Then register with Claude Code (setup prints the exact line with the binary's full path):
 
-   ```
-   cargo build --release
-   ```
+```
+claude mcp add --scope user ynab -- ~/.cargo/bin/ynab-mcp
+```
 
-4. Register with Claude Code (user scope, so every project sees it):
+Start a new session and ask for the `status` tool.
 
-   ```
-   claude mcp add --scope user ynab -- ~/src/ynab-mcp/scripts/ynab-mcp.sh
-   ```
+### Where things live
 
-The launcher script reads the token from the Keychain at start, so nothing secret lands in
-`~/.claude.json`.
+| What | macOS / Linux | Windows |
+|---|---|---|
+| Config | `~/.config/ynab-mcp/config.toml` (mode 600) | `%APPDATA%\ynab-mcp\config.toml` |
+| Token | macOS Keychain item `ynab-mcp`; Linux secret-service via `secret-tool` | config file only |
+| Journal | `~/.local/share/ynab-mcp/journal.jsonl` | `%LOCALAPPDATA%\ynab-mcp\journal.jsonl` |
+| Error log | `~/.local/share/ynab-mcp/ynab-mcp.log` | `%LOCALAPPDATA%\ynab-mcp\ynab-mcp.log` |
+
+`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are honored on macOS and Linux.
+
+### Config file
+
+```toml
+plan_id = "last-used"     # or a plan id from `status`
+allow_writes = false      # true registers create_transactions, undo_batch, undo_last
+# journal = "~/somewhere/journal.jsonl"
+# access_token = "..."    # only if the secret store is unavailable; file must be mode 600
+```
+
+Environment variables override the file: `YNAB_ACCESS_TOKEN`, `YNAB_PLAN_ID`,
+`YNAB_MCP_ALLOW_WRITES`, `YNAB_MCP_JOURNAL`. Token lookup order is env var, then
+`access_token` in the config, then the secret store. Unknown keys in the config are an error.
+
+### Linux notes
+
+`secret-tool` comes from `libsecret` (`libsecret-tools` on Debian/Ubuntu, `libsecret` on Arch)
+and needs a running secret service such as GNOME Keyring or KeePassXC. On a window-manager
+setup without one, run `ynab-mcp setup --token-in-config` to keep the token in the config file
+instead. The server refuses to start if that file is readable by other users.
+
+### Windows notes
+
+There is no secret-store integration on Windows; `ynab-mcp setup` stores the token in the
+config file under `%APPDATA%`, which is private to your user account by default. WSL users
+should use the Linux binary inside WSL.
 
 ## Undo and the write journal
 
@@ -66,15 +106,21 @@ phases:
    are skipped unless `force=true`. `missing` rows are recorded as resolved. A batch stays
    open until every row is deleted or missing, so re-running is safe.
 
-## Environment
+## Errors, logs, and filing an issue
 
-| Var | Default | Meaning |
-|---|---|---|
-| `YNAB_ACCESS_TOKEN` | required | personal access token |
-| `YNAB_PLAN_ID` | `last-used` | plan (budget) id |
-| `YNAB_MCP_ALLOW_WRITES` | unset | `1` registers `create_transactions`, `undo_batch`, `undo_last` |
-| `YNAB_MCP_JOURNAL` | `~/.local/share/ynab-mcp/journal.jsonl` | write journal path |
-| `RUST_LOG` | `info` | log filter; logs go to stderr |
+No telemetry. Nothing leaves your machine unless you open a link yourself.
+
+- Every warning and error is written to `~/.local/share/ynab-mcp/ynab-mcp.log`
+  (`%LOCALAPPDATA%\ynab-mcp\ynab-mcp.log` on Windows), redacted before it hits disk: ids
+  become `<id>`, anything token-shaped becomes `<secret>`. Payees, memos, amounts, and category
+  names are never logged in the first place.
+- Every error handed back to the agent is also logged, so the log has the full story even
+  when the conversation moved on. Bad tool arguments log at warn; YNAB and journal failures at
+  error.
+- `ynab-mcp report` (or the `diagnostic_report` tool from inside a session) prints a redacted
+  report: version, OS, whether the config and journal exist, token source, writes flag, and the
+  last 40 log lines. It ends with a prefilled GitHub new-issue link. Read the report, then open
+  the link and submit if you want to.
 
 ## Develop
 

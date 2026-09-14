@@ -16,23 +16,31 @@ use crate::money::{from_decimal, to_decimal};
 use crate::reconcile::{self, BankRow, YnabRow};
 use crate::ynab::{self, Client, SaveTransaction, TransactionFilter, TransactionKind, YnabError};
 
+pub struct ServerMeta {
+    pub token_source: String,
+    pub config_path: std::path::PathBuf,
+    pub log_path: Option<std::path::PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct YnabServer {
     client: Arc<Client>,
     journal: Arc<Journal>,
+    meta: Arc<ServerMeta>,
     allow_writes: bool,
     tool_router: ToolRouter<Self>,
 }
 
 impl YnabServer {
-    pub fn new(client: Client, journal: Journal, allow_writes: bool) -> Self {
-        let mut tool_router = Self::read_router() + Self::history_router();
+    pub fn new(client: Client, journal: Journal, allow_writes: bool, meta: ServerMeta) -> Self {
+        let mut tool_router = Self::read_router() + Self::history_router() + Self::diag_router();
         if allow_writes {
             tool_router += Self::write_router();
         }
         Self {
             client: Arc::new(client),
             journal: Arc::new(journal),
+            meta: Arc::new(meta),
             allow_writes,
             tool_router,
         }
@@ -40,12 +48,20 @@ impl YnabServer {
 }
 
 fn client_name(ctx: &RequestContext<RoleServer>) -> Option<String> {
-    ctx.peer
+    let name = ctx
+        .peer
         .peer_info()
-        .map(|info| info.client_info.name.clone())
+        .map(|info| info.client_info.name.clone());
+    if name.is_none() {
+        tracing::warn!("no client info on this connection; journal entry will have client=null");
+    }
+    name
 }
 
+/// Every error handed back to the model is also logged, so the local log has the full story
+/// even when the agent moves on.
 fn journal_error(e: anyhow::Error) -> McpError {
+    tracing::error!(error = format!("{e:#}"), "journal failure");
     McpError::internal_error(format!("journal: {e:#}"), None)
 }
 
@@ -56,6 +72,7 @@ fn json_result<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
 }
 
 fn api_error(e: YnabError) -> McpError {
+    tracing::error!(error = %e, "YNAB call failed");
     match e {
         YnabError::Api { status: 429, .. } => {
             McpError::internal_error("YNAB rate limit hit (200 requests/hour)".to_string(), None)
@@ -65,7 +82,9 @@ fn api_error(e: YnabError) -> McpError {
 }
 
 fn invalid(msg: impl Into<String>) -> McpError {
-    McpError::invalid_params(msg.into(), None)
+    let msg = msg.into();
+    tracing::warn!(msg, "rejected tool arguments");
+    McpError::invalid_params(msg, None)
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -365,22 +384,26 @@ impl YnabServer {
             ..Default::default()
         };
         let txns = self.client.transactions(&filter).await.map_err(api_error)?;
+        // A YNAB date that does not parse is an API-shape bug, not a row to skip quietly.
         let ynab_rows: Vec<YnabRow> = txns
             .iter()
             .filter(|t| !t.deleted)
-            .filter_map(|t| {
-                let date = reconcile::parse_date(&t.date)?;
-                Some(YnabRow {
+            .map(|t| {
+                let date = reconcile::parse_date(&t.date).ok_or_else(|| {
+                    tracing::error!(id = %t.id, date = %t.date, "YNAB returned an unparseable date");
+                    McpError::internal_error(format!("YNAB returned unparseable date {:?}", t.date), None)
+                })?;
+                Ok(YnabRow {
                     id: t.id.clone(),
                     date,
                     amount: t.amount,
-                    payee: t.payee_name.clone().unwrap_or_default(),
+                    payee: t.payee_name.clone(),
                     category: t.category_name.clone(),
                     cleared: t.cleared.clone(),
                     approved: t.approved,
                 })
             })
-            .collect();
+            .collect::<Result<Vec<_>, McpError>>()?;
 
         let result = reconcile::reconcile(&bank_rows, &ynab_rows, window_days);
         json_result(&json!({
@@ -424,6 +447,29 @@ impl YnabServer {
         json_result(
             &json!({ "journal": self.journal.path().display().to_string(), "batches": rows }),
         )
+    }
+}
+
+#[tool_router(router = diag_router, vis = "pub")]
+impl YnabServer {
+    #[tool(
+        description = "Redacted diagnostic report (version, OS, config state, recent local warnings/errors; never tokens, payees, or amounts) plus a prefilled GitHub issue link. Nothing is sent; show the link to the user."
+    )]
+    async fn diagnostic_report(&self) -> Result<CallToolResult, McpError> {
+        let input = crate::diag::ReportInput {
+            token_source: Some(self.meta.token_source.clone()),
+            allow_writes: Some(self.allow_writes),
+            config_error: None,
+            config_path: self.meta.config_path.clone(),
+            journal_path: self.journal.path().to_path_buf(),
+        };
+        let body = crate::diag::build_report(&input, self.meta.log_path.as_deref())
+            .map_err(|e| McpError::internal_error(format!("report: {e:#}"), None))?;
+        json_result(&json!({
+            "report": body,
+            "file_issue_url": crate::diag::issue_url("ynab-mcp: <short description>", &body),
+            "log_path": self.meta.log_path.as_ref().map(|p| p.display().to_string()),
+        }))
     }
 }
 
@@ -512,6 +558,44 @@ impl YnabServer {
                 import_id: t.import_id.clone(),
             })
             .collect();
+        // If YNAB's response shape drifts, the ids exist but we could not build undo ops for
+        // them. Journal what we have, then fail loudly with every id so nothing is orphaned.
+        if ops.len() != result.transaction_ids.len() {
+            let known: Vec<String> = ops.iter().map(|o| o.transaction_id.clone()).collect();
+            let orphaned: Vec<String> = result
+                .transaction_ids
+                .iter()
+                .filter(|id| !known.contains(id))
+                .cloned()
+                .collect();
+            tracing::error!(
+                ?orphaned,
+                "created rows missing from YNAB response; undo cannot cover them"
+            );
+            let partial = BatchRecord {
+                batch_id: journal::new_batch_id(),
+                at: journal::now(),
+                plan_id: self.client.plan_id().to_string(),
+                tool: "create_transactions".to_string(),
+                client: client_name(&ctx),
+                ops,
+            };
+            if let Err(e) = locked.append(&Record::Batch(partial)) {
+                tracing::error!(
+                    error = format!("{e:#}"),
+                    "and the partial batch could not be journaled"
+                );
+            }
+            return Err(McpError::internal_error(
+                format!(
+                    "YNAB created {} rows but returned details for only {}; these ids are NOT undoable and must be checked by hand: {:?}",
+                    result.transaction_ids.len(),
+                    known.len(),
+                    orphaned
+                ),
+                None,
+            ));
+        }
         let batch = BatchRecord {
             batch_id: journal::new_batch_id(),
             at: journal::now(),
@@ -592,7 +676,13 @@ impl YnabServer {
                         current.insert(t.id.clone(), t);
                     }
                 }
-                Err(YnabError::Api { status: 404, .. }) => gone_accounts.push(account.to_string()),
+                Err(YnabError::Api { status: 404, .. }) => {
+                    tracing::warn!(
+                        account,
+                        "undo: account not found in YNAB; its rows will be flagged missing"
+                    );
+                    gone_accounts.push(account.to_string())
+                }
                 Err(e) => return Err(api_error(e)),
             }
         }

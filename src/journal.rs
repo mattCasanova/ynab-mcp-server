@@ -95,14 +95,6 @@ impl Journal {
         Self { path }
     }
 
-    pub fn default_path() -> Result<PathBuf> {
-        if let Ok(p) = std::env::var("YNAB_MCP_JOURNAL") {
-            return Ok(PathBuf::from(p));
-        }
-        let home = std::env::var("HOME").context("HOME is not set")?;
-        Ok(Path::new(&home).join(".local/share/ynab-mcp/journal.jsonl"))
-    }
-
     pub fn path(&self) -> &Path {
         &self.path
     }

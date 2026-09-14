@@ -15,6 +15,8 @@ const BASE_URL: &str = "https://api.ynab.com/v1";
 pub enum YnabError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("token contains characters that are not valid in an HTTP header")]
+    BadToken,
     #[error("YNAB API error {status}: {name} — {detail}")]
     Api {
         status: u16,
@@ -242,7 +244,7 @@ impl Client {
     pub fn new(access_token: &str, plan_id: String) -> Result<Self, YnabError> {
         let mut headers = HeaderMap::new();
         let mut auth = HeaderValue::from_str(&format!("Bearer {access_token}"))
-            .expect("token is valid header text");
+            .map_err(|_| YnabError::BadToken)?;
         auth.set_sensitive(true);
         headers.insert(AUTHORIZATION, auth);
         let http = reqwest::Client::builder()
@@ -273,20 +275,31 @@ impl Client {
         req: reqwest::RequestBuilder,
     ) -> Result<T, YnabError> {
         let resp = req.send().await?;
-        if let Some(limit) = resp
-            .headers()
-            .get("x-rate-limit")
-            .and_then(|v| v.to_str().ok())
-        {
-            *self.rate_limit.lock().expect("rate limit lock") = Some(limit.to_string());
+        if let Some(raw) = resp.headers().get("x-rate-limit") {
+            match raw.to_str() {
+                Ok(limit) => {
+                    *self.rate_limit.lock().expect("rate limit lock") = Some(limit.to_string())
+                }
+                Err(e) => tracing::warn!(error = %e, "x-rate-limit header is not text; ignoring"),
+            }
         }
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(error = %e, %status, "could not read error body");
+                    format!("(unreadable error body: {e})")
+                }
+            };
             let (name, detail) = match serde_json::from_str::<ErrorEnvelope>(&body) {
                 Ok(e) => (e.error.name, e.error.detail),
-                Err(_) => ("unknown".to_string(), body),
+                Err(e) => {
+                    tracing::warn!(error = %e, %status, "error body is not the YNAB error shape");
+                    ("unknown".to_string(), body)
+                }
             };
+            tracing::warn!(%status, name, "YNAB API error");
             return Err(YnabError::Api {
                 status: status.as_u16(),
                 name,

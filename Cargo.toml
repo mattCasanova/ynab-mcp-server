@@ -8,7 +8,9 @@ license = "MIT"
 [dependencies]
 rmcp = { version = "3.3", features = ["server", "macros", "transport-io", "schemars"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
+# rustls with the ring provider: no cmake/NASM at build time, so CI can build all three OSes natively.
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
@@ -17,6 +19,8 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
+toml = "1"
+rpassword = "7"
 
 [profile.release]
 lto = true
