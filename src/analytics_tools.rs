@@ -268,7 +268,7 @@ impl YnabServer {
         Parameters(args): Parameters<MonthArg>,
     ) -> Result<CallToolResult, McpError> {
         let month = args.month.unwrap_or_else(|| "current".to_string());
-        let detail = self.client().month(&month).await.map_err(api_error)?;
+        let (detail, from_cache) = self.month_detail(&month).await?;
         let live: Vec<&Category> = detail
             .categories
             .iter()
@@ -307,6 +307,7 @@ impl YnabServer {
             .collect();
         json_result(&json!({
             "month": detail.month,
+            "from_cache": from_cache,
             "income": to_decimal(detail.income),
             "assigned": to_decimal(detail.budgeted),
             "activity": to_decimal(detail.activity),
@@ -334,8 +335,15 @@ impl YnabServer {
         // One month call per month: per-category assigned/activity/goal for that month.
         let mut per_cat: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
         let mut meta: HashMap<String, (String, Option<String>, Option<i64>)> = HashMap::new();
+        let mut live_calls = 0;
+        let mut cached_months = 0;
         for m in &ids {
-            let detail = self.client().month(m).await.map_err(api_error)?;
+            let (detail, from_cache) = self.month_detail(m).await?;
+            if from_cache {
+                cached_months += 1;
+            } else {
+                live_calls += 1;
+            }
             for c in detail
                 .categories
                 .iter()
@@ -404,6 +412,7 @@ impl YnabServer {
             .collect();
         json_result(&json!({
             "months": month_keys(today, months),
+            "month_calls": { "live": live_calls, "from_cache": cached_months },
             "goal_types": { "MF": "monthly funding", "NEED": "needed for spending by date/period", "TB": "target balance", "TBD": "target balance by date", "DEBT": "debt payoff" },
             "goals": goals,
         }))

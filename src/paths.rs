@@ -38,6 +38,10 @@ pub fn data_dir() -> Result<PathBuf> {
     }
 }
 
+pub fn cache_dir() -> Result<PathBuf> {
+    Ok(data_dir()?.join("cache"))
+}
+
 pub fn default_journal() -> Result<PathBuf> {
     Ok(data_dir()?.join("journal.jsonl"))
 }

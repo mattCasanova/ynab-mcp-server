@@ -56,6 +56,11 @@ struct PlansData {
 }
 
 #[derive(Debug, Deserialize)]
+struct PlanData {
+    plan: PlanSummary,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct Account {
     pub id: String,
     pub name: String,
@@ -76,7 +81,7 @@ struct AccountsData {
     accounts: Vec<Account>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Category {
     pub id: String,
     pub category_group_id: String,
@@ -110,7 +115,7 @@ struct CategoriesData {
     category_groups: Vec<CategoryGroup>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MonthDetail {
     pub month: String,
     pub note: Option<String>,
@@ -338,6 +343,12 @@ impl Client {
     pub async fn plans(&self) -> Result<Vec<PlanSummary>, YnabError> {
         let data: PlansData = self.get(format!("{BASE_URL}/plans"), &[]).await?;
         Ok(data.plans)
+    }
+
+    /// The concrete plan id behind "last-used" or "default", so caches are keyed per plan.
+    pub async fn resolve_plan_id(&self) -> Result<String, YnabError> {
+        let data: PlanData = self.get(self.plan_url(""), &[]).await?;
+        Ok(data.plan.id)
     }
 
     pub async fn accounts(&self) -> Result<Vec<Account>, YnabError> {

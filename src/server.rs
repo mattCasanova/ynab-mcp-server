@@ -11,6 +11,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::cache::MonthCache;
 use crate::journal::{self, BatchRecord, BatchState, Journal, Op, Record, Skipped, UndoRecord};
 use crate::money::{from_decimal, to_decimal};
 use crate::reconcile::{self, BankRow, YnabRow};
@@ -20,6 +21,8 @@ pub struct ServerMeta {
     pub token_source: String,
     pub config_path: std::path::PathBuf,
     pub log_path: Option<std::path::PathBuf>,
+    pub cache_root: std::path::PathBuf,
+    pub cache_ttl_days: i64,
 }
 
 #[derive(Clone)]
@@ -27,6 +30,8 @@ pub struct YnabServer {
     client: Arc<Client>,
     journal: Arc<Journal>,
     meta: Arc<ServerMeta>,
+    /// Built on first use, once the concrete plan id is known (keys the cache per plan).
+    month_cache: Arc<tokio::sync::OnceCell<MonthCache>>,
     allow_writes: bool,
     tool_router: ToolRouter<Self>,
 }
@@ -34,6 +39,41 @@ pub struct YnabServer {
 impl YnabServer {
     pub(crate) fn client(&self) -> &Client {
         &self.client
+    }
+
+    async fn month_cache(&self) -> Result<&MonthCache, McpError> {
+        self.month_cache
+            .get_or_try_init(|| async {
+                let plan = self.client.resolve_plan_id().await.map_err(api_error)?;
+                let dir = self.meta.cache_root.join(&plan).join("months");
+                tracing::info!(dir = %dir.display(), ttl_days = self.meta.cache_ttl_days, "month cache ready");
+                Ok(MonthCache::new(dir, self.meta.cache_ttl_days))
+            })
+            .await
+    }
+
+    /// Month detail through the cache. "current" and the current month are always live.
+    pub(crate) async fn month_detail(
+        &self,
+        month: &str,
+    ) -> Result<(ynab::MonthDetail, bool), McpError> {
+        let today = chrono::Local::now().date_naive();
+        let Some(date) = reconcile::parse_date(month) else {
+            if month != "current" {
+                return Err(invalid(format!(
+                    "month must be YYYY-MM-01 or \"current\", got {month:?}"
+                )));
+            }
+            return Ok((self.client.month(month).await.map_err(api_error)?, false));
+        };
+        let cache = self.month_cache().await?;
+        let now = chrono::Utc::now();
+        if let Some(detail) = cache.get(date, today, now) {
+            return Ok((detail, true));
+        }
+        let detail = self.client.month(month).await.map_err(api_error)?;
+        cache.put(date, today, now, &detail);
+        Ok((detail, false))
     }
 
     pub fn new(client: Client, journal: Journal, allow_writes: bool, meta: ServerMeta) -> Self {
@@ -48,6 +88,7 @@ impl YnabServer {
             client: Arc::new(client),
             journal: Arc::new(journal),
             meta: Arc::new(meta),
+            month_cache: Arc::new(tokio::sync::OnceCell::new()),
             allow_writes,
             tool_router,
         }
@@ -209,10 +250,17 @@ impl YnabServer {
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         let plans = self.client.plans().await.map_err(api_error)?;
+        let cache = self.month_cache().await?;
         json_result(&json!({
             "plan_id": self.client.plan_id(),
             "writes_enabled": self.allow_writes,
             "rate_limit": self.client.rate_limit(),
+            "month_cache": {
+                "enabled": cache.enabled(),
+                "ttl_days": self.meta.cache_ttl_days,
+                "cached_months": cache.count(),
+                "dir": cache.dir().display().to_string(),
+            },
             "plans": plans,
         }))
     }
@@ -278,9 +326,10 @@ impl YnabServer {
         &self,
         Parameters(args): Parameters<GetMonthArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let month = self.client.month(&args.month).await.map_err(api_error)?;
+        let (month, from_cache) = self.month_detail(&args.month).await?;
         json_result(&json!({
             "month": month.month,
+            "from_cache": from_cache,
             "note": month.note,
             "income": to_decimal(month.income),
             "assigned": to_decimal(month.budgeted),

@@ -1,5 +1,6 @@
 mod analytics;
 mod analytics_tools;
+mod cache;
 mod config;
 mod diag;
 mod journal;
@@ -28,6 +29,7 @@ Usage:
   ynab-mcp setup --token-in-config
                                 same, but keep the token in config.toml (mode 600)
                                 instead of the OS secret store
+  ynab-mcp cache clear          delete the cached month data (safe; it is refetched)
   ynab-mcp report               print a redacted diagnostic report and a prefilled
                                 GitHub issue link (nothing is sent; you open the link)
   ynab-mcp --version | --help
@@ -66,6 +68,21 @@ async fn main() -> Result<()> {
             .await
         }
         ["report"] => report(log_path.as_deref()),
+        ["cache", "clear"] => {
+            let dir = paths::cache_dir()?;
+            let mut removed = 0;
+            if dir.exists() {
+                for plan in std::fs::read_dir(&dir)? {
+                    let plan_dir = plan?.path().join("months");
+                    removed += cache::MonthCache::new(plan_dir, 1).clear()?;
+                }
+            }
+            println!(
+                "removed {removed} cached month file(s) under {}",
+                dir.display()
+            );
+            Ok(())
+        }
         ["--version" | "-V"] => {
             println!("ynab-mcp {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -137,6 +154,8 @@ async fn serve(log_path: Option<&std::path::Path>) -> Result<()> {
         token_source: format!("{:?}", config.token_source),
         config_path: config.config_path.clone(),
         log_path: log_path.map(Path::to_path_buf),
+        cache_root: paths::cache_dir()?,
+        cache_ttl_days: config.cache_ttl_days,
     };
     let service = YnabServer::new(client, journal, config.allow_writes, meta)
         .serve(stdio())

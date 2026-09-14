@@ -76,6 +76,7 @@ Start a new session and ask for the `status` tool.
 | Token | macOS Keychain item `ynab-mcp`; Linux secret-service via `secret-tool` | config file only |
 | Journal | `~/.local/share/ynab-mcp/journal.jsonl` | `%LOCALAPPDATA%\ynab-mcp\journal.jsonl` |
 | Error log | `~/.local/share/ynab-mcp/ynab-mcp.log` | `%LOCALAPPDATA%\ynab-mcp\ynab-mcp.log` |
+| Month cache | `~/.local/share/ynab-mcp/cache/` | `%LOCALAPPDATA%\ynab-mcp\cache\` |
 
 `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are honored on macOS and Linux.
 
@@ -85,11 +86,12 @@ Start a new session and ask for the `status` tool.
 plan_id = "last-used"     # or a plan id from `status`
 allow_writes = false      # true registers create_transactions, undo_batch, undo_last
 # journal = "~/somewhere/journal.jsonl"
+# cache_ttl_days = 30       # closed-month cache; 0 disables
 # access_token = "..."    # only if the secret store is unavailable; file must be mode 600
 ```
 
 Environment variables override the file: `YNAB_ACCESS_TOKEN`, `YNAB_PLAN_ID`,
-`YNAB_MCP_ALLOW_WRITES`, `YNAB_MCP_JOURNAL`. Token lookup order is env var, then
+`YNAB_MCP_ALLOW_WRITES`, `YNAB_MCP_JOURNAL`, `YNAB_MCP_CACHE_TTL_DAYS`. Token lookup order is env var, then
 `access_token` in the config, then the secret store. Unknown keys in the config are an error.
 
 ### Linux notes
@@ -123,6 +125,20 @@ phases:
 2. With `confirm=true` the deletable rows are deleted. Flagged `reconciled` / `changed` rows
    are skipped unless `force=true`. `missing` rows are recorded as resolved. A batch stays
    open until every row is deleted or missing, so re-running is safe.
+
+## Month cache
+
+YNAB serves per-category month numbers one month per call, so a six-month `goal_analysis`
+would be six live calls every time. Closed months rarely change, so month detail is cached on
+disk under `~/.local/share/ynab-mcp/cache/<plan id>/months/`:
+
+- the current month is never cached;
+- the previous month is cached for one day (you are usually still reconciling it);
+- older months are cached for `cache_ttl_days` (default 30; `0` disables).
+
+`status` shows how many months are cached, `goal_analysis` reports live vs cached calls, and
+`ynab-mcp cache clear` throws the cache away (it is refetched on demand). If you edit an old
+month in YNAB and want the tools to see it now, clear the cache.
 
 ## Errors, logs, and filing an issue
 

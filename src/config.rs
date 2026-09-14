@@ -22,6 +22,8 @@ pub struct FileConfig {
     pub journal: Option<String>,
     /// Fallback when the OS secret store is not available. The file must be mode 600.
     pub access_token: Option<String>,
+    /// Days to keep closed months in the on-disk cache. 0 disables. Default 30.
+    pub cache_ttl_days: Option<i64>,
 }
 
 impl FileConfig {
@@ -95,6 +97,7 @@ pub struct Config {
     pub allow_writes: bool,
     pub journal_path: PathBuf,
     pub config_path: PathBuf,
+    pub cache_ttl_days: i64,
 }
 
 fn env_flag(name: &str) -> Option<bool> {
@@ -154,6 +157,16 @@ impl Config {
             Some(p) => paths::expand_tilde(&p)?,
             None => paths::default_journal()?,
         };
+        let cache_ttl_days = match std::env::var("YNAB_MCP_CACHE_TTL_DAYS") {
+            Ok(v) => match v.trim().parse::<i64>() {
+                Ok(n) if n >= 0 => n,
+                _ => bail!("YNAB_MCP_CACHE_TTL_DAYS must be a non-negative integer, got {v:?}"),
+            },
+            Err(_) => file.cache_ttl_days.unwrap_or(30),
+        };
+        if cache_ttl_days < 0 {
+            bail!("cache_ttl_days must be 0 or more, got {cache_ttl_days}");
+        }
         Ok(Self {
             access_token,
             token_source,
@@ -161,6 +174,7 @@ impl Config {
             allow_writes,
             journal_path,
             config_path,
+            cache_ttl_days,
         })
     }
 }
@@ -216,6 +230,7 @@ mod tests {
             allow_writes: Some(false),
             journal: None,
             access_token: None,
+            cache_ttl_days: None,
         };
         c.save(&path).unwrap();
         let back = FileConfig::load(&path).unwrap().unwrap();
