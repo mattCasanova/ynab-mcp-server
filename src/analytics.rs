@@ -83,8 +83,9 @@ pub struct CategoryMonths {
     pub total: String,
     pub average_per_month: String,
     /// Average of the most recent three months minus average of the earlier months, decimal.
-    /// Negative means spending grew (activity is negative for outflows).
-    pub recent_vs_earlier: String,
+    /// Negative means spending grew (activity is negative for outflows). Null when fewer than
+    /// two earlier months exist, since there is nothing to compare against.
+    pub recent_vs_earlier: Option<String>,
     pub transaction_count: usize,
 }
 
@@ -115,8 +116,11 @@ pub fn spending_summary(postings: &[Posting], month_keys: &[String]) -> Vec<Cate
                 .map(|k| months.get(k).copied().unwrap_or(0))
                 .collect();
             let split = series.len().saturating_sub(3);
-            let recent = avg(&series[split..]);
-            let earlier = avg(&series[..split]);
+            let recent_vs_earlier = if split >= 2 {
+                Some(to_decimal(avg(&series[split..]) - avg(&series[..split])))
+            } else {
+                None
+            };
             CategoryMonths {
                 category_id,
                 category,
@@ -126,7 +130,7 @@ pub fn spending_summary(postings: &[Posting], month_keys: &[String]) -> Vec<Cate
                     .collect(),
                 total: to_decimal(total),
                 average_per_month: to_decimal(total / n_months),
-                recent_vs_earlier: to_decimal(recent - earlier),
+                recent_vs_earlier,
                 transaction_count: count,
             }
         })
@@ -408,6 +412,30 @@ mod tests {
         assert_eq!(g.total, "-22.00");
         assert_eq!(g.average_per_month, "-11.00");
         assert_eq!(g.transaction_count, 3);
+        assert!(
+            g.recent_vs_earlier.is_none(),
+            "two months is not enough to compare"
+        );
+    }
+
+    #[test]
+    fn recent_vs_earlier_needs_two_earlier_months() {
+        let keys: Vec<String> = ["2026-05", "2026-06", "2026-07", "2026-08", "2026-09"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rows = spending_summary(
+            &postings(&[
+                txn("1", "2026-05-10", -10000, "A", "G"),
+                txn("2", "2026-06-10", -10000, "A", "G"),
+                txn("3", "2026-07-10", -20000, "A", "G"),
+                txn("4", "2026-08-10", -20000, "A", "G"),
+                txn("5", "2026-09-10", -20000, "A", "G"),
+            ])
+            .unwrap(),
+            &keys,
+        );
+        assert_eq!(rows[0].recent_vs_earlier.as_deref(), Some("-10.00"));
     }
 
     #[test]

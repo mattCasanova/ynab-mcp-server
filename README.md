@@ -193,5 +193,7 @@ printf '%s\n' \
 ## Notes
 
 - YNAB's API renamed budgets to **plans** (`/v1/plans/{plan_id}`); this client uses the new paths.
-- Rate limit is 200 requests per hour per token. `status` shows the running count.
+- Rate limit is 200 requests per hour per token. YNAB no longer sends a usage header, so
+  `status` reports the count this process has made in the last hour; a second agent on the same
+  token has its own count.
 - Money is milliunits on the wire (`i64`, 1000 = 1.00) and converted exactly once in the output layer.

@@ -251,7 +251,7 @@ pub struct UndoLastArgs {
 #[tool_router(router = read_router, vis = "pub")]
 impl YnabServer {
     #[tool(
-        description = "Plans on this token, the plan in use, write mode, and rate-limit usage (200/hour)."
+        description = "Plans on this token, the plan in use, write mode, month-cache state, and how many of YNAB's 200 requests/hour this process has used."
     )]
     async fn status(&self) -> Result<CallToolResult, McpError> {
         let plans = self.client.plans().await.map_err(api_error)?;
@@ -259,7 +259,7 @@ impl YnabServer {
         json_result(&json!({
             "plan_id": self.client.plan_id(),
             "writes_enabled": self.allow_writes,
-            "rate_limit": self.client.rate_limit(),
+            "rate_usage": self.client.rate_usage(),
             "month_cache": {
                 "enabled": cache.enabled(),
                 "ttl_days": self.meta.cache_ttl_days,

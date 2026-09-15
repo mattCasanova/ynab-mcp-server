@@ -258,8 +258,23 @@ pub struct TransactionFilter {
 pub struct Client {
     http: reqwest::Client,
     plan_id: String,
-    /// Last observed `X-Rate-Limit` header, e.g. "12/200".
+    /// Last observed `X-Rate-Limit` header if YNAB ever sends one again (it did not in
+    /// September 2026), e.g. "12/200".
     rate_limit: Mutex<Option<String>>,
+    /// Timestamps of requests made by this process in the last hour, for the local count.
+    recent_requests: Mutex<std::collections::VecDeque<std::time::Instant>>,
+}
+
+pub const REQUESTS_PER_HOUR: usize = 200;
+
+#[derive(Debug, Serialize)]
+pub struct RateUsage {
+    /// Requests this process made in the last rolling hour. Other processes on the same token
+    /// (a second agent, the YNAB app itself does not count) are not included.
+    pub used_this_hour_by_this_process: usize,
+    pub limit_per_hour: usize,
+    /// Header-reported usage when available; null otherwise.
+    pub server_reported: Option<String>,
 }
 
 impl Client {
@@ -277,6 +292,7 @@ impl Client {
             http,
             plan_id,
             rate_limit: Mutex::new(None),
+            recent_requests: Mutex::new(Default::default()),
         })
     }
 
@@ -284,8 +300,32 @@ impl Client {
         &self.plan_id
     }
 
-    pub fn rate_limit(&self) -> Option<String> {
-        self.rate_limit.lock().expect("rate limit lock").clone()
+    pub fn rate_usage(&self) -> RateUsage {
+        let hour = std::time::Duration::from_secs(3600);
+        let now = std::time::Instant::now();
+        let mut recent = self.recent_requests.lock().expect("request log lock");
+        while recent
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > hour)
+        {
+            recent.pop_front();
+        }
+        RateUsage {
+            used_this_hour_by_this_process: recent.len(),
+            limit_per_hour: REQUESTS_PER_HOUR,
+            server_reported: self.rate_limit.lock().expect("rate limit lock").clone(),
+        }
+    }
+
+    fn note_request(&self) {
+        let mut recent = self.recent_requests.lock().expect("request log lock");
+        recent.push_back(std::time::Instant::now());
+        if recent.len() >= REQUESTS_PER_HOUR * 9 / 10 {
+            tracing::warn!(
+                used = recent.len(),
+                "approaching YNAB's {REQUESTS_PER_HOUR}/hour limit"
+            );
+        }
     }
 
     fn plan_url(&self, path: &str) -> String {
@@ -296,6 +336,7 @@ impl Client {
         &self,
         req: reqwest::RequestBuilder,
     ) -> Result<T, YnabError> {
+        self.note_request();
         let resp = req.send().await?;
         if let Some(raw) = resp.headers().get("x-rate-limit") {
             match raw.to_str() {
