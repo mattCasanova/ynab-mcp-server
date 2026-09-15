@@ -24,6 +24,7 @@ Plan and use cases: `~/workspace/ynab/ynab-mcp-plan.md`.
 | `budget_vs_actual` | one month: overspent, spent over target, assigned-but-unused, targets underfunded |
 | `goal_analysis` | every target over N months: assigned vs spent per month, months over target, money moved in/out and from where |
 | `money_movements` | category-to-category moves with names and per-category net |
+| `pdf_to_csv` | bank statement PDF → Date, Description, Amount CSV, entirely on this machine; the PDF text never comes back |
 | `export_transactions` | CSV or JSON to a path; filter by dates, account, category, or category group; splits one row per leg |
 | `import_bank_csv` | one or more bank CSV files → parse by column mapping → dedupe across files → reconcile; `confirm` creates the missing rows (writes) |
 | `trigger_bank_import` | **write, gated.** YNAB's Import button for linked accounts |
@@ -130,6 +131,16 @@ phases:
    open until every row is deleted or missing, so re-running is safe.
 
 ## Files in and out
+
+- **Statement PDFs stay on your machine.** `pdf_to_csv` (also `ynab-mcp pdf-to-csv` on the
+  command line) reads the PDF locally, finds the transaction rows, scrubs any run of eight or
+  more digits out of descriptions, and writes a Date, Description, Amount CSV. Only the row
+  count, totals, section names with last four digits, and a three-row sample come back to the
+  agent. Account numbers, addresses, and the rest of the statement are parsed and thrown away.
+  Statements that cover several accounts need `account` (a name fragment or last four).
+  Tested on Capital One 360 statements; the parser is generic (date-led rows, trailing amount
+  and balance, Debit/Credit or +/- signs, wrapped descriptions), so other banks should mostly
+  work and will say plainly when they do not.
 
 - **Export** writes exactly the rows you ask for to the path you give, and refuses to overwrite
   unless told to. The category-group filter is the tax-ledger case: every leg in the business

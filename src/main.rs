@@ -7,10 +7,13 @@ mod diag;
 mod journal;
 mod money;
 mod paths;
+mod pdf_import;
+mod pdf_text;
 mod reconcile;
 mod secrets;
 mod server;
 mod setup;
+mod statement;
 mod transfer_tools;
 mod ynab;
 
@@ -31,6 +34,9 @@ Usage:
   ynab-mcp setup --token-in-config
                                 same, but keep the token in config.toml (mode 600)
                                 instead of the OS secret store
+  ynab-mcp pdf-to-csv <statement.pdf> <out.csv> [--account NAME|LAST4] [--year YYYY] [--overwrite]
+                                turn a bank statement PDF into a Date,Description,Amount CSV
+                                on this machine; the PDF text never leaves it
   ynab-mcp cache clear          delete the cached month data (safe; it is refetched)
   ynab-mcp report               print a redacted diagnostic report and a prefilled
                                 GitHub issue link (nothing is sent; you open the link)
@@ -70,6 +76,7 @@ async fn main() -> Result<()> {
             .await
         }
         ["report"] => report(log_path.as_deref()),
+        ["pdf-to-csv", rest @ ..] => pdf_to_csv_cli(rest),
         ["cache", "clear"] => {
             let dir = paths::cache_dir()?;
             let mut removed = 0;
@@ -98,6 +105,58 @@ async fn main() -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn pdf_to_csv_cli(args: &[&str]) -> Result<()> {
+    let mut positional: Vec<&str> = Vec::new();
+    let mut account: Option<&str> = None;
+    let mut year: Option<i32> = None;
+    let mut overwrite = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i] {
+            "--account" => {
+                account = Some(
+                    args.get(i + 1)
+                        .copied()
+                        .ok_or_else(|| anyhow::anyhow!("--account needs a value"))?,
+                );
+                i += 2;
+            }
+            "--year" => {
+                year = Some(
+                    args.get(i + 1)
+                        .ok_or_else(|| anyhow::anyhow!("--year needs a value"))?
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("--year must be a number"))?,
+                );
+                i += 2;
+            }
+            "--overwrite" => {
+                overwrite = true;
+                i += 1;
+            }
+            other if other.starts_with("--") => anyhow::bail!("unknown flag {other}\n\n{USAGE}"),
+            other => {
+                positional.push(other);
+                i += 1;
+            }
+        }
+    }
+    let [pdf, csv] = positional.as_slice() else {
+        anyhow::bail!("pdf-to-csv needs <statement.pdf> <out.csv>\n\n{USAGE}");
+    };
+    let summary = pdf_import::convert(
+        &pdf_import::resolve(pdf)?,
+        &pdf_import::resolve(csv)?,
+        &pdf_import::Options {
+            account,
+            year,
+            overwrite,
+        },
+    )?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
+    Ok(())
 }
 
 fn report(log_path: Option<&std::path::Path>) -> Result<()> {

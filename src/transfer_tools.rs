@@ -239,8 +239,48 @@ fn read_bank_file(path: &Path, mapping: &ColumnMapping) -> Result<ParsedFile, Mc
     })
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PdfToCsvArgs {
+    /// The statement PDF. Read locally; its text is never returned.
+    pub pdf_path: String,
+    /// Where to write the CSV (Date, Description, Amount; outflows negative). `~/` expands.
+    pub csv_path: String,
+    /// Which account section of the statement, by name fragment or last four digits, when the
+    /// statement covers several accounts.
+    pub account: Option<String>,
+    /// Year to assume when the statement prints dates without one and no period line is found.
+    pub year: Option<i32>,
+    /// Replace the CSV if it exists. Default false.
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
 #[tool_router(router = transfer_router, vis = "pub")]
 impl YnabServer {
+    #[tool(
+        description = "Convert a bank statement PDF into a CSV of date, description, amount, entirely on this machine: the PDF text (account numbers, addresses) is parsed and discarded, descriptions are scrubbed of 8+ digit runs, and only the rows and a 3-row sample come back. Then use import_bank_csv with mapping {date: Date, description: Description, amount: Amount}."
+    )]
+    async fn pdf_to_csv(
+        &self,
+        Parameters(args): Parameters<PdfToCsvArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let pdf = resolve_path(&args.pdf_path)?;
+        let csv = resolve_path(&args.csv_path)?;
+        let opts = crate::pdf_import::Options {
+            account: args.account.as_deref(),
+            year: args.year,
+            overwrite: args.overwrite,
+        };
+        let summary = crate::pdf_import::convert(&pdf, &csv, &opts).map_err(|e| {
+            tracing::warn!(error = format!("{e:#}"), "pdf_to_csv failed");
+            invalid(format!("{e:#}"))
+        })?;
+        json_result(&json!({
+            "summary": summary,
+            "next": "import_bank_csv with paths=[csv_path], the YNAB account_id, and mapping {\"date\":\"Date\",\"description\":\"Description\",\"amount\":\"Amount\"}",
+        }))
+    }
+
     #[tool(
         description = "Write transactions to a CSV or JSON file: date, account, payee, category group, category, memo, amount, cleared, approved, ids. Splits are one row per leg. Filter by dates, account, category, or category group (e.g. a business group for a tax year). Writes only to the given path; refuses to overwrite unless asked."
     )]
