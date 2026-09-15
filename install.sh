@@ -37,9 +37,10 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 echo "downloading $name.tar.gz"
 curl -fsSL "$base/$name.tar.gz" -o "$tmp/$name.tar.gz"
-curl -fsSL "$base/$name.tar.gz.sha256" -o "$tmp/expected.sha256"
+curl -fsSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS"
 
-expected="$(awk '{print $1}' "$tmp/expected.sha256")"
+expected="$(awk -v f="$name.tar.gz" '$2 == f {print $1}' "$tmp/SHA256SUMS")"
+[ -n "$expected" ] || { echo "no checksum for $name.tar.gz in SHA256SUMS; refusing to install" >&2; exit 1; }
 if command -v sha256sum >/dev/null 2>&1; then
   actual="$(sha256sum "$tmp/$name.tar.gz" | awk '{print $1}')"
 else
