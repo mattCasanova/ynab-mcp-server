@@ -43,7 +43,7 @@ pub struct Reconciliation {
 
 pub fn reconcile(bank: &[BankRow], ynab: &[YnabRow], window_days: i64) -> Reconciliation {
     let mut bank_sorted: Vec<BankRow> = bank.to_vec();
-    bank_sorted.sort_by(|a, b| a.date.cmp(&b.date));
+    bank_sorted.sort_by_key(|r| r.date);
 
     let mut used = vec![false; ynab.len()];
     let mut matched = Vec::new();
