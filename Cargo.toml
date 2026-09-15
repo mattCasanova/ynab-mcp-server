@@ -1,6 +1,6 @@
 [package]
 name = "ynab-mcp-server"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "MCP server for YNAB: read-only by construction, journaled two-phase undo for the one write tool, no telemetry"
@@ -10,7 +10,7 @@ homepage = "https://github.com/mattCasanova/ynab-mcp-server"
 readme = "README.md"
 keywords = ["ynab", "mcp", "budget", "claude", "finance"]
 categories = ["command-line-utilities", "finance"]
-exclude = [".github/", "*.jsonl"]
+exclude = [".github/", "*.jsonl", "install.sh"]
 
 # The crate is ynab-mcp-server on crates.io (ynab-mcp was already taken); the binary stays ynab-mcp.
 [[bin]]

@@ -46,8 +46,20 @@ Then you, your partner, and the model talk about it.
 
 ## Install
 
-Prebuilt binaries for macOS (Apple Silicon and Intel), Linux x86_64, and Windows x86_64 are the
-plan, with a one-line installer. With Rust installed:
+**macOS or Linux, no Rust needed:**
+
+```
+curl -fsSL https://raw.githubusercontent.com/mattCasanova/ynab-mcp-server/master/install.sh | sh
+```
+
+That downloads the latest release binary for your machine, checks its SHA-256, and puts it in
+`~/.local/bin/ynab-mcp`. Set `YNAB_MCP_INSTALL_DIR` to put it somewhere else.
+
+**Windows:** download the `x86_64-pc-windows-msvc` zip from the
+[releases page](https://github.com/mattCasanova/ynab-mcp-server/releases) and put `ynab-mcp.exe`
+somewhere on your PATH.
+
+**With Rust installed:**
 
 ```
 cargo install ynab-mcp-server
