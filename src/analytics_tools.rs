@@ -363,7 +363,9 @@ impl YnabServer {
                     "available_end": to_decimal(c.balance),
                     "target": c.goal_target.map(to_decimal),
                     "spent_over_target": c.goal_target.is_some_and(|t| -c.activity > t),
-                    "funded": c.goal_under_funded.is_some_and(|u| u == 0),
+                    // null from YNAB means it did not say (e.g. a dated target outside its
+                    // period), so the answer is unknown, not "no".
+                    "funded": c.goal_under_funded.map(|u| u == 0),
                     "under_funded": c.goal_under_funded.map(to_decimal),
                 });
                 per_cat.entry(c.id.clone()).or_default().push(row);
@@ -409,6 +411,7 @@ impl YnabServer {
                     .filter(|m| m["spent_over_target"] == true)
                     .count();
                 let unfunded = months_json.iter().filter(|m| m["funded"] == false).count();
+                let funding_unknown = months_json.iter().filter(|m| m["funded"].is_null()).count();
                 let rollover = match (goal_type.as_deref(), needs_whole) {
                     (Some("NEED"), Some(true)) => Some("set_aside_another"),
                     (Some("NEED"), Some(false)) => Some("refill_up_to"),
@@ -428,6 +431,7 @@ impl YnabServer {
                     "target_now": target.map(to_decimal),
                     "months_spent_over_target": over,
                     "months_not_funded": unfunded,
+                    "months_funding_unknown": funding_unknown,
                     "months_examined": months_json.len(),
                     "moved_in_total": to_decimal(moved_in),
                     "moved_out_total": to_decimal(moved_out),
@@ -446,7 +450,7 @@ impl YnabServer {
                 "TBD": "Savings Balance by date",
                 "DEBT": "debt payoff"
             },
-            "how_to_read": "Every goal reports both months_spent_over_target and months_not_funded. Which one matters depends on what the category is for, which the API cannot say: a set_aside_another target with a growing available balance is being saved for (over-target spending there is usually the trip happening); a refill_up_to target is a spending ceiling. Raise what you find with that context; do not hide it.",
+            "how_to_read": "Every goal reports both months_spent_over_target and months_not_funded (months_funding_unknown counts months where YNAB gave no under-funded figure, typically dated targets outside their period). Which one matters depends on what the category is for, which the API cannot say: a set_aside_another target with a growing available balance is being saved for (over-target spending there is usually the trip happening); a refill_up_to target is a spending ceiling. Raise what you find with that context; do not hide it.",
             "goals": goals,
         }))
     }
