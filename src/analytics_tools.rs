@@ -52,6 +52,9 @@ pub struct MonthArg {
     pub month: Option<String>,
 }
 
+/// category id -> (name, goal_type, goal_target, goal_needs_whole_amount)
+type GoalMeta = HashMap<String, (String, Option<String>, Option<i64>, Option<bool>)>;
+
 fn today() -> NaiveDate {
     chrono::Local::now().date_naive()
 }
@@ -321,7 +324,7 @@ impl YnabServer {
     }
 
     #[tool(
-        description = "Every category with a target, over the last N months. Spending targets: assigned vs spent per month and how many months spend exceeded the target. Saving targets: whether each month was funded. Both: money moved in or out and from which categories. The facts for 'why am I not hitting my goals'; the conclusion is the user's."
+        description = "Every category with a target, over the last N months: assigned vs spent per month, months over target, months not funded, the target's rollover mode (refill_up_to vs set_aside_another), and money moved in or out with counterpart categories. The facts for 'why am I not hitting my goals'; the conclusion is the user's."
     )]
     async fn goal_analysis(
         &self,
@@ -334,7 +337,7 @@ impl YnabServer {
 
         // One month call per month: per-category assigned/activity/goal for that month.
         let mut per_cat: BTreeMap<String, Vec<serde_json::Value>> = BTreeMap::new();
-        let mut meta: HashMap<String, (String, Option<String>, Option<i64>)> = HashMap::new();
+        let mut meta: GoalMeta = HashMap::new();
         let mut live_calls = 0;
         let mut cached_months = 0;
         for m in &ids {
@@ -349,27 +352,29 @@ impl YnabServer {
                 .iter()
                 .filter(|c| !c.deleted && !c.hidden && c.goal_type.is_some())
             {
-                // Spending targets (NEED) are judged on what went out; saving targets
-                // (MF, TB, TBD) on whether the month was funded. Never both.
-                let is_spending = c.goal_type.as_deref() == Some("NEED");
-                let mut row = json!({
+                // Both readings, every goal: what went out vs the target, and whether the
+                // month was funded. YNAB cannot say which one the user means by a target
+                // (a "set aside another 200" on Vacation is saving; on Groceries it may be
+                // spending), so the server reports both and the conversation decides.
+                let row = json!({
                     "month": analytics::month_key(crate::reconcile::parse_date(&detail.month).unwrap_or(today)),
                     "assigned": to_decimal(c.budgeted),
                     "activity": to_decimal(c.activity),
                     "available_end": to_decimal(c.balance),
                     "target": c.goal_target.map(to_decimal),
+                    "spent_over_target": c.goal_target.is_some_and(|t| -c.activity > t),
+                    "funded": c.goal_under_funded.is_some_and(|u| u == 0),
                     "under_funded": c.goal_under_funded.map(to_decimal),
                 });
-                if is_spending {
-                    row["spent_over_target"] =
-                        json!(c.goal_target.is_some_and(|t| -c.activity > t));
-                } else {
-                    row["funded"] = json!(c.goal_under_funded.is_some_and(|u| u == 0));
-                }
                 per_cat.entry(c.id.clone()).or_default().push(row);
                 meta.insert(
                     c.id.clone(),
-                    (c.name.clone(), c.goal_type.clone(), c.goal_target),
+                    (
+                        c.name.clone(),
+                        c.goal_type.clone(),
+                        c.goal_target,
+                        c.goal_needs_whole_amount,
+                    ),
                 );
             }
         }
@@ -397,10 +402,18 @@ impl YnabServer {
         let goals: Vec<_> = per_cat
             .iter()
             .map(|(id, months_json)| {
-                let (name, goal_type, target) = meta.get(id).cloned().expect("meta recorded with per_cat");
-                let is_spending = goal_type.as_deref() == Some("NEED");
-                let over = months_json.iter().filter(|m| m["spent_over_target"] == true).count();
+                let (name, goal_type, target, needs_whole) =
+                    meta.get(id).cloned().expect("meta recorded with per_cat");
+                let over = months_json
+                    .iter()
+                    .filter(|m| m["spent_over_target"] == true)
+                    .count();
                 let unfunded = months_json.iter().filter(|m| m["funded"] == false).count();
+                let rollover = match (goal_type.as_deref(), needs_whole) {
+                    (Some("NEED"), Some(true)) => Some("set_aside_another"),
+                    (Some("NEED"), Some(false)) => Some("refill_up_to"),
+                    _ => None,
+                };
                 let (moved_in, moved_out, counterparts) = moved.get(id).cloned().unwrap_or_default();
                 let mut cp: Vec<_> = counterparts
                     .into_iter()
@@ -411,10 +424,10 @@ impl YnabServer {
                     "category_id": id,
                     "category": names.get(id).cloned().unwrap_or(name),
                     "goal_type": goal_type,
-                    "kind": if is_spending { "spending" } else { "saving" },
+                    "rollover": rollover,
                     "target_now": target.map(to_decimal),
-                    "months_spent_over_target": if is_spending { Some(over) } else { None },
-                    "months_not_funded": if is_spending { None } else { Some(unfunded) },
+                    "months_spent_over_target": over,
+                    "months_not_funded": unfunded,
                     "months_examined": months_json.len(),
                     "moved_in_total": to_decimal(moved_in),
                     "moved_out_total": to_decimal(moved_out),
@@ -427,13 +440,13 @@ impl YnabServer {
             "months": month_keys(today, months),
             "month_calls": { "live": live_calls, "from_cache": cached_months },
             "goal_types": {
-                "NEED": "spending target (Needed for Spending): judged on spend vs target",
-                "MF": "saving target (Monthly Savings Builder): judged on funded or not",
-                "TB": "saving target (Savings Balance): judged on funded or not",
-                "TBD": "saving target (Savings Balance by date): judged on funded or not",
-                "DEBT": "debt payoff: judged on funded or not"
+                "NEED": "Needed for Spending. rollover says which flavor: refill_up_to tops the balance back to the target (spending-shaped); set_aside_another adds the target every period and lets the balance grow (saving-shaped)",
+                "MF": "Monthly Savings Builder (legacy): add the target every month",
+                "TB": "Savings Balance: reach and hold the target",
+                "TBD": "Savings Balance by date",
+                "DEBT": "debt payoff"
             },
-            "note": "A category funded for a big goal but typed as a spending target will show over-target every month; that is a fact to raise in the conversation, not to hide. Suggest retyping it in YNAB if the user agrees.",
+            "how_to_read": "Every goal reports both months_spent_over_target and months_not_funded. Which one matters depends on what the category is for, which the API cannot say: a set_aside_another target with a growing available balance is being saved for (over-target spending there is usually the trip happening); a refill_up_to target is a spending ceiling. Raise what you find with that context; do not hide it.",
             "goals": goals,
         }))
     }

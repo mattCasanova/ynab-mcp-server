@@ -94,6 +94,9 @@ pub struct Category {
     pub activity: Milliunits,
     pub balance: Milliunits,
     pub goal_type: Option<String>,
+    /// NEED targets only: true = "Set aside another X" (adds X every period, balance
+    /// accumulates), false = "Refill up to X" (tops the balance back up to X).
+    pub goal_needs_whole_amount: Option<bool>,
     pub goal_target: Option<Milliunits>,
     pub goal_target_date: Option<String>,
     pub goal_percentage_complete: Option<i64>,
