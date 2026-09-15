@@ -321,7 +321,7 @@ impl YnabServer {
     }
 
     #[tool(
-        description = "Every category with a target, over the last N months: target vs what was actually assigned and spent each month, how many months spend exceeded the target, and the money moved into or out of it (with counterpart categories). The facts for 'why am I not hitting my goals'; the conclusion is the user's."
+        description = "Every category with a target, over the last N months. Spending targets: assigned vs spent per month and how many months spend exceeded the target. Saving targets: whether each month was funded. Both: money moved in or out and from which categories. The facts for 'why am I not hitting my goals'; the conclusion is the user's."
     )]
     async fn goal_analysis(
         &self,
@@ -349,15 +349,24 @@ impl YnabServer {
                 .iter()
                 .filter(|c| !c.deleted && !c.hidden && c.goal_type.is_some())
             {
-                per_cat.entry(c.id.clone()).or_default().push(json!({
+                // Spending targets (NEED) are judged on what went out; saving targets
+                // (MF, TB, TBD) on whether the month was funded. Never both.
+                let is_spending = c.goal_type.as_deref() == Some("NEED");
+                let mut row = json!({
                     "month": analytics::month_key(crate::reconcile::parse_date(&detail.month).unwrap_or(today)),
                     "assigned": to_decimal(c.budgeted),
                     "activity": to_decimal(c.activity),
                     "available_end": to_decimal(c.balance),
                     "target": c.goal_target.map(to_decimal),
-                    "spent_over_target": c.goal_target.is_some_and(|t| -c.activity > t),
                     "under_funded": c.goal_under_funded.map(to_decimal),
-                }));
+                });
+                if is_spending {
+                    row["spent_over_target"] =
+                        json!(c.goal_target.is_some_and(|t| -c.activity > t));
+                } else {
+                    row["funded"] = json!(c.goal_under_funded.is_some_and(|u| u == 0));
+                }
+                per_cat.entry(c.id.clone()).or_default().push(row);
                 meta.insert(
                     c.id.clone(),
                     (c.name.clone(), c.goal_type.clone(), c.goal_target),
@@ -389,7 +398,9 @@ impl YnabServer {
             .iter()
             .map(|(id, months_json)| {
                 let (name, goal_type, target) = meta.get(id).cloned().expect("meta recorded with per_cat");
+                let is_spending = goal_type.as_deref() == Some("NEED");
                 let over = months_json.iter().filter(|m| m["spent_over_target"] == true).count();
+                let unfunded = months_json.iter().filter(|m| m["funded"] == false).count();
                 let (moved_in, moved_out, counterparts) = moved.get(id).cloned().unwrap_or_default();
                 let mut cp: Vec<_> = counterparts
                     .into_iter()
@@ -400,8 +411,10 @@ impl YnabServer {
                     "category_id": id,
                     "category": names.get(id).cloned().unwrap_or(name),
                     "goal_type": goal_type,
+                    "kind": if is_spending { "spending" } else { "saving" },
                     "target_now": target.map(to_decimal),
-                    "months_spent_over_target": over,
+                    "months_spent_over_target": if is_spending { Some(over) } else { None },
+                    "months_not_funded": if is_spending { None } else { Some(unfunded) },
                     "months_examined": months_json.len(),
                     "moved_in_total": to_decimal(moved_in),
                     "moved_out_total": to_decimal(moved_out),
@@ -413,7 +426,14 @@ impl YnabServer {
         json_result(&json!({
             "months": month_keys(today, months),
             "month_calls": { "live": live_calls, "from_cache": cached_months },
-            "goal_types": { "MF": "monthly funding", "NEED": "needed for spending by date/period", "TB": "target balance", "TBD": "target balance by date", "DEBT": "debt payoff" },
+            "goal_types": {
+                "NEED": "spending target (Needed for Spending): judged on spend vs target",
+                "MF": "saving target (Monthly Savings Builder): judged on funded or not",
+                "TB": "saving target (Savings Balance): judged on funded or not",
+                "TBD": "saving target (Savings Balance by date): judged on funded or not",
+                "DEBT": "debt payoff: judged on funded or not"
+            },
+            "note": "A category funded for a big goal but typed as a spending target will show over-target every month; that is a fact to raise in the conversation, not to hide. Suggest retyping it in YNAB if the user agrees.",
             "goals": goals,
         }))
     }
