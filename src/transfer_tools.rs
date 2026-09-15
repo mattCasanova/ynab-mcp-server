@@ -60,6 +60,13 @@ pub struct ColumnMapping {
     /// For a single amount column: true if the bank lists money OUT as positive. Default false.
     #[serde(default)]
     pub outflow_is_positive: bool,
+    /// Header of a type column that says which way the money went (e.g. "Debit"/"Credit"),
+    /// used with a single unsigned amount column. Capital One and many others export this way.
+    #[serde(rename = "type")]
+    pub type_column: Option<String>,
+    /// Values in the type column that mean money OUT, case-insensitive.
+    /// Default: debit, withdrawal, dr, out, payment, purchase.
+    pub outflow_values: Option<Vec<String>>,
     /// strftime pattern if the date is not YYYY-MM-DD, MM/DD/YYYY, or MM/DD/YY (e.g. "%d.%m.%Y").
     pub date_format: Option<String>,
 }
@@ -157,6 +164,17 @@ fn read_bank_file(path: &Path, mapping: &ColumnMapping) -> Result<ParsedFile, Mc
     };
     let date_i = index(&mapping.date)?;
     let desc_i = index(&mapping.description)?;
+    let type_i = mapping.type_column.as_deref().map(index).transpose()?;
+    if type_i.is_some() && mapping.amount.is_none() {
+        return Err(invalid(
+            "mapping.type needs a single amount column (mapping.amount)",
+        ));
+    }
+    let default_outflows = ["debit", "withdrawal", "dr", "out", "payment", "purchase"];
+    let outflow_values: Vec<String> = match &mapping.outflow_values {
+        Some(v) => v.iter().map(|x| x.trim().to_ascii_lowercase()).collect(),
+        None => default_outflows.iter().map(|x| x.to_string()).collect(),
+    };
     let amount_cols = match (&mapping.amount, &mapping.debit, &mapping.credit) {
         (Some(a), None, None) => (Some(index(a)?), None, None),
         (None, Some(d), Some(c)) => (None, Some(index(d)?), Some(index(c)?)),
@@ -181,7 +199,19 @@ fn read_bank_file(path: &Path, mapping: &ColumnMapping) -> Result<ParsedFile, Mc
             (Some(a), _, _) => {
                 let v = parse_money(get(a))
                     .map_err(|e| invalid(format!("{} line {line}: {e}", path.display())))?;
-                if mapping.outflow_is_positive { -v } else { v }
+                match type_i {
+                    // Type column decides the sign; the amount is taken as a magnitude.
+                    Some(ti) => {
+                        let kind = get(ti).trim().to_ascii_lowercase();
+                        if outflow_values.contains(&kind) {
+                            -v.abs()
+                        } else {
+                            v.abs()
+                        }
+                    }
+                    None if mapping.outflow_is_positive => -v,
+                    None => v,
+                }
             }
             (None, d, c) => {
                 let debit = d
@@ -522,6 +552,8 @@ mod tests {
             debit: Some("Debit".into()),
             credit: Some("Credit".into()),
             outflow_is_positive: false,
+            type_column: None,
+            outflow_values: None,
             date_format: None,
         };
         let f = read_bank_file(&p, &mapping).unwrap();
@@ -540,11 +572,35 @@ mod tests {
             debit: None,
             credit: None,
             outflow_is_positive: true,
+            type_column: None,
+            outflow_values: None,
             date_format: Some("%d.%m.%Y".into()),
         };
         let f = read_bank_file(&p, &mapping).unwrap();
         assert_eq!(f.rows[0].amount, -45000);
         assert_eq!(f.rows[0].date.to_string(), "2026-09-01");
+    }
+
+    #[test]
+    fn type_column_sets_the_sign_capital_one_style() {
+        let p = write_temp(
+            "capone.csv",
+            "Account Number,Transaction Date,Transaction Amount,Transaction Type,Transaction Description,Balance\n5861,08/03/2026,\"$6,028.56\",Debit,Withdrawal from BILT,2860.57\n5861,08/05/2026,\"$4,000.00\",Credit,Deposit from Savings,6860.57\n",
+        );
+        let mapping = ColumnMapping {
+            date: "Transaction Date".into(),
+            description: "Transaction Description".into(),
+            amount: Some("Transaction Amount".into()),
+            debit: None,
+            credit: None,
+            outflow_is_positive: false,
+            type_column: Some("Transaction Type".into()),
+            outflow_values: None,
+            date_format: None,
+        };
+        let f = read_bank_file(&p, &mapping).unwrap();
+        assert_eq!(f.rows[0].amount, -6_028_560);
+        assert_eq!(f.rows[1].amount, 4_000_000);
     }
 
     #[test]
@@ -557,6 +613,8 @@ mod tests {
             debit: None,
             credit: None,
             outflow_is_positive: false,
+            type_column: None,
+            outflow_values: None,
             date_format: None,
         };
         let err = read_bank_file(&p, &mapping).unwrap_err();
