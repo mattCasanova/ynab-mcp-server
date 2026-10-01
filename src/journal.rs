@@ -440,15 +440,41 @@ pub fn fold(records: Vec<Record>) -> Vec<WriteState> {
                 }));
             }
             Record::Undo(undo) => {
-                let Some(state) = writes.iter_mut().find(|w| w.batch_id() == undo.batch_id) else {
+                let Some(idx) = writes.iter().position(|w| w.batch_id() == undo.batch_id) else {
                     tracing::warn!(batch_id = %undo.batch_id, "undo record for unknown batch; ignoring");
                     continue;
                 };
-                state.push_undo(undo);
+                let recreated = match (&writes[idx], &undo.recreated_transaction_id) {
+                    (WriteState::Replace(r), Some(new_id)) => {
+                        Some((r.record.original.transaction_id.clone(), new_id.clone()))
+                    }
+                    _ => None,
+                };
+                writes[idx].push_undo(undo);
+                if let Some((old_id, new_id)) = recreated {
+                    repoint_batches(&mut writes, &old_id, &new_id);
+                }
             }
         }
     }
     writes
+}
+
+/// An undone replace re-creates its original under a new id. If that original had been
+/// created by a journaled batch, the batch's op now points at a row that no longer exists, so
+/// re-point it at the re-created row: same account, date, and amount, just a new id.
+fn repoint_batches(writes: &mut [WriteState], old_id: &str, new_id: &str) {
+    for w in writes.iter_mut() {
+        let WriteState::Batch(b) = w else { continue };
+        for op in b
+            .remaining
+            .iter_mut()
+            .chain(b.batch.ops.iter_mut())
+            .filter(|op| op.transaction_id == old_id)
+        {
+            op.transaction_id = new_id.to_string();
+        }
+    }
 }
 
 /// Pick the write an undo targets: by id, or the most recent one that is still open. The
@@ -770,6 +796,24 @@ mod tests {
             Record::Undo(recreate_only),
         ]);
         assert_eq!(states[0].status(), "undone");
+    }
+
+    #[test]
+    fn undoing_a_replace_repoints_the_batch_that_created_the_original() {
+        let mut u = UndoRecord::new("r1".into(), None);
+        u.deleted.push("new".into());
+        u.recreated_transaction_id = Some("old-again".into());
+        let states = fold(vec![
+            batch("b1", &["old", "other"]),
+            replace("r1", true),
+            Record::Undo(u),
+        ]);
+        assert_eq!(states[1].status(), "undone");
+        let b = as_batch(&states[0]);
+        assert_eq!(b.status(), "open");
+        assert_eq!(b.remaining[0].transaction_id, "old-again");
+        assert_eq!(b.remaining[1].transaction_id, "other");
+        assert_eq!(b.batch.ops[0].transaction_id, "old-again");
     }
 
     #[test]
