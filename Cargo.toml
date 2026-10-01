@@ -1,9 +1,9 @@
 [package]
 name = "ynab-mcp-server"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.89"
-description = "MCP server for YNAB: read-only by construction, journaled two-phase undo for the one write tool, no telemetry"
+description = "MCP server for YNAB: read-only unless opted in, every write journaled, two-phase, and undoable, no telemetry"
 license = "MIT"
 repository = "https://github.com/mattCasanova/ynab-mcp-server"
 homepage = "https://github.com/mattCasanova/ynab-mcp-server"
