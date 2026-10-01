@@ -737,6 +737,26 @@ impl YnabServer {
             .create_transactions(&saves)
             .await
             .map_err(api_error)?;
+        if result.transaction_ids.is_empty() {
+            // Nothing to journal. YNAB keeps an import_id reserved even after the row that
+            // carried it is deleted, so an undone row blocks a same-amount same-day re-create.
+            tracing::warn!(
+                duplicates = result.duplicate_import_ids.len(),
+                "create: YNAB created nothing; every row matched an existing import_id"
+            );
+            return Ok(json!({
+                "batch_id": null,
+                "created": 0,
+                "transaction_ids": [],
+                "skipped_duplicate_import_ids": result.duplicate_import_ids,
+                "note": "YNAB already has a row with each of these import_ids, possibly one that was since deleted (YNAB keeps the id reserved). Nothing was created or journaled.",
+            }));
+        }
+        let months: Vec<String> = saves
+            .iter()
+            .filter_map(|t| crate::edit_tools::month_of(&t.date))
+            .collect();
+        let dropped = self.invalidate_months(&months).await;
         let ops: Vec<Op> = result
             .transactions
             .iter()
@@ -813,6 +833,7 @@ impl YnabServer {
             "created": result.transaction_ids.len(),
             "transaction_ids": result.transaction_ids,
             "skipped_duplicate_import_ids": result.duplicate_import_ids,
+            "months_dropped_from_cache": dropped,
             "undo_with": "undo_batch or undo_last",
         }))
     }
@@ -835,6 +856,8 @@ pub(crate) enum RowState {
 struct UndoPlan<'a> {
     batch: &'a BatchState,
     rows: Vec<(&'a Op, RowState)>,
+    /// The rows as YNAB has them now, for the delete (a split needs its legs nudged after).
+    current: std::collections::HashMap<String, ynab::Transaction>,
 }
 
 impl YnabServer {
@@ -911,7 +934,11 @@ impl YnabServer {
                 (op, row_state)
             })
             .collect();
-        Ok(UndoPlan { batch: state, rows })
+        Ok(UndoPlan {
+            batch: state,
+            rows,
+            current,
+        })
     }
 
     async fn undo(
@@ -986,6 +1013,7 @@ impl YnabServer {
         }
 
         let mut undo = UndoRecord::new(plan.batch.batch.batch_id.clone(), client);
+        let mut nudges: Vec<crate::edit_tools::Nudge> = Vec::new();
         for (op, row_state) in &plan.rows {
             let id = op.transaction_id.clone();
             let delete = match row_state {
@@ -1004,8 +1032,21 @@ impl YnabServer {
                 });
                 continue;
             }
-            match self.client.delete_transaction(&id).await {
-                Ok(()) => undo.deleted.push(id),
+            let Some(row) = plan.current.get(&id) else {
+                // Every deletable row came out of `current`; not finding it is a bug, not a
+                // reason to delete blind.
+                tracing::error!("undo: deletable row without its detail; skipping");
+                undo.skipped.push(Skipped {
+                    transaction_id: id,
+                    reason: "internal: row detail missing; re-run the undo".to_string(),
+                });
+                continue;
+            };
+            match self.delete_with_recompute(row).await {
+                Ok(n) => {
+                    undo.deleted.push(id);
+                    nudges.extend(n);
+                }
                 Err(e) => undo.skipped.push(Skipped {
                     transaction_id: id,
                     reason: e.to_string(),
@@ -1023,6 +1064,7 @@ impl YnabServer {
             "missing_already_gone": undo.missing,
             "skipped": undo.skipped,
             "remaining_in_batch": remaining,
+            "recompute_nudges": nudges,
         }))
     }
 }

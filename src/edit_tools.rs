@@ -502,6 +502,128 @@ enum AssignCheck {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Deleting splits: YNAB's rollup quirk
+// ---------------------------------------------------------------------------------------------
+
+/// Observed 2026-10-01 against the live API: deleting a split through the API removes the row
+/// from the ledger and the account balance, but the month rollup of each leg's category keeps
+/// counting the leg until some write that references that category lands. A plain (non-split)
+/// delete recomputes correctly. So after deleting a split, every leg category is nudged with a
+/// zero-amount row that is created and deleted again.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct Nudge {
+    pub category_id: String,
+    pub month: String,
+    /// Always "zero_row" today; kept so a future mechanism can be told apart in old output.
+    pub how: &'static str,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// `YYYY-MM-DD` to the `YYYY-MM-01` the month endpoints take.
+pub(crate) fn month_of(date: &str) -> Option<String> {
+    reconcile::parse_date(date).map(|d| format!("{:04}-{:02}-01", d.year(), d.month()))
+}
+
+/// Distinct categories of a split's live legs, in leg order. Empty for a non-split.
+pub(crate) fn leg_categories(t: &Transaction) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for leg in t.subtransactions.iter().filter(|l| !l.deleted) {
+        if let Some(c) = &leg.category_id
+            && !out.contains(c)
+        {
+            out.push(c.clone());
+        }
+    }
+    out
+}
+
+impl YnabServer {
+    /// Delete a row; if it was a split, nudge each leg's category so YNAB recomputes its month.
+    /// The delete's error is returned; nudge failures are logged and reported, never fatal.
+    pub(crate) async fn delete_with_recompute(
+        &self,
+        t: &Transaction,
+    ) -> Result<Vec<Nudge>, YnabError> {
+        self.client().delete_transaction(&t.id).await?;
+        let Some(month) = month_of(&t.date) else {
+            tracing::error!(
+                date = %t.date,
+                "deleted a row whose date does not parse; cache not dropped, legs not nudged"
+            );
+            return Ok(Vec::new());
+        };
+        self.invalidate_months(std::slice::from_ref(&month)).await;
+        let categories = leg_categories(t);
+        if categories.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut nudges = Vec::with_capacity(categories.len());
+        for category_id in categories {
+            nudges.push(
+                self.nudge_category(&month, &category_id, &t.account_id, &t.date)
+                    .await,
+            );
+        }
+        Ok(nudges)
+    }
+
+    /// Create a zero-amount row in the category and delete it again. Any transaction write
+    /// that references a category makes YNAB recompute that category's month, and a plain
+    /// delete recomputes correctly, so the pair leaves the ledger as it was and the totals
+    /// right. (Re-writing the assigned amount unchanged does nothing: tried 2026-10-01.)
+    async fn nudge_category(
+        &self,
+        month: &str,
+        category_id: &str,
+        account_id: &str,
+        date: &str,
+    ) -> Nudge {
+        let nudge = |error: Option<String>| Nudge {
+            category_id: category_id.to_string(),
+            month: month.to_string(),
+            how: "zero_row",
+            ok: error.is_none(),
+            error,
+        };
+        let save = SaveTransaction {
+            account_id: account_id.to_string(),
+            date: date.to_string(),
+            amount: 0,
+            payee_id: None,
+            payee_name: None,
+            category_id: Some(category_id.to_string()),
+            memo: Some("ynab-mcp recompute nudge, auto-deleted".to_string()),
+            cleared: "uncleared".to_string(),
+            approved: false,
+            flag_color: None,
+            import_id: None,
+            subtransactions: None,
+        };
+        let created = match self.client().create_transactions(&[save]).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "zero-row nudge: create failed; month rollup may be stale");
+                return nudge(Some(e.to_string()));
+            }
+        };
+        let Some(id) = created.transaction_ids.first() else {
+            tracing::error!("zero-row nudge: YNAB created nothing; month rollup may be stale");
+            return nudge(Some("YNAB created no zero-amount row".to_string()));
+        };
+        match self.client().delete_transaction(id).await {
+            Ok(()) => nudge(None),
+            Err(e) => {
+                tracing::error!(error = %e, "zero-row nudge: the zero-amount row could not be deleted");
+                nudge(Some(format!(
+                    "zero-amount row {id} was created but could not be deleted: {e}"
+                )))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------------------------
 
@@ -592,11 +714,14 @@ impl YnabServer {
         };
 
         // 2. Delete the original. A failure here leaves both rows; say so loudly.
-        let delete_error = match self.client().delete_transaction(&original.id).await {
-            Ok(()) => None,
+        if let Some(month) = month_of(&original.date) {
+            self.invalidate_months(&[month]).await;
+        }
+        let (delete_error, nudges) = match self.delete_with_recompute(&original).await {
+            Ok(nudges) => (None, nudges),
             Err(e) => {
                 tracing::error!(error = %e, "replace: replacement created but delete of the original failed");
-                Some(e)
+                (Some(e), Vec::new())
             }
         };
         let record = ReplaceRecord {
@@ -642,6 +767,7 @@ impl YnabServer {
             "replacement_transaction_id": new_id,
             "amount": to_decimal(original.amount),
             "replacement": snapshot_json(&record.replacement),
+            "recompute_nudges": nudges,
             "undo_with": "undo_batch or undo_last",
         }))
     }
@@ -803,20 +929,29 @@ impl YnabServer {
     async fn check_replacement(
         &self,
         snapshot: &TransactionSnapshot,
-    ) -> Result<RowState, McpError> {
+    ) -> Result<(RowState, Option<Transaction>), McpError> {
         match self.client().transaction(&snapshot.transaction_id).await {
-            Err(YnabError::Api { status: 404, .. }) => Ok(RowState::Missing {
-                reason: "transaction not found in YNAB (deleted by hand?)".to_string(),
-            }),
+            Err(YnabError::Api { status: 404, .. }) => Ok((
+                RowState::Missing {
+                    reason: "transaction not found in YNAB (deleted by hand?)".to_string(),
+                },
+                None,
+            )),
             Err(e) => Err(api_error(e)),
-            Ok(t) if t.deleted => Ok(RowState::Missing {
-                reason: "transaction deleted in YNAB".to_string(),
-            }),
-            Ok(t) if t.cleared == "reconciled" => Ok(RowState::Reconciled),
-            Ok(t) if !row_matches_snapshot(&t, snapshot) => Ok(RowState::ChangedSinceCreated {
-                now: transaction_json(&t),
-            }),
-            Ok(_) => Ok(RowState::Deletable),
+            Ok(t) if t.deleted => Ok((
+                RowState::Missing {
+                    reason: "transaction deleted in YNAB".to_string(),
+                },
+                None,
+            )),
+            Ok(t) if t.cleared == "reconciled" => Ok((RowState::Reconciled, Some(t))),
+            Ok(t) if !row_matches_snapshot(&t, snapshot) => Ok((
+                RowState::ChangedSinceCreated {
+                    now: transaction_json(&t),
+                },
+                Some(t),
+            )),
+            Ok(t) => Ok((RowState::Deletable, Some(t))),
         }
     }
 
@@ -830,10 +965,11 @@ impl YnabServer {
     ) -> Result<CallToolResult, McpError> {
         let record = &state.record;
         let replacement_id = record.replacement.transaction_id.clone();
-        let check = if state.replacement_gone {
-            None
+        let (check, current) = if state.replacement_gone {
+            (None, None)
         } else {
-            Some(self.check_replacement(&record.replacement).await?)
+            let (check, current) = self.check_replacement(&record.replacement).await?;
+            (Some(check), current)
         };
         let flagged = matches!(
             check,
@@ -861,9 +997,15 @@ impl YnabServer {
 
         let mut undo = UndoRecord::new(record.batch_id.clone(), client);
         let mut gone = state.replacement_gone;
-        match check {
-            None => {}
-            Some(RowState::Missing { reason }) => {
+        let mut nudges: Vec<Nudge> = Vec::new();
+        let deletable = match &check {
+            None | Some(RowState::Missing { .. }) => false,
+            Some(RowState::Deletable) => true,
+            Some(RowState::Reconciled | RowState::ChangedSinceCreated { .. }) => force,
+        };
+        match (&check, current) {
+            (None, _) => {}
+            (Some(RowState::Missing { reason }), _) => {
                 tracing::warn!(
                     reason,
                     "undo replace: replacement already gone; recording as resolved"
@@ -871,15 +1013,27 @@ impl YnabServer {
                 undo.missing.push(replacement_id.clone());
                 gone = true;
             }
-            Some(RowState::Deletable) => {
-                self.delete_for_undo(&replacement_id, &mut undo, &mut gone)
-                    .await;
+            (Some(_), Some(row)) if deletable => match self.delete_with_recompute(&row).await {
+                Ok(n) => {
+                    undo.deleted.push(replacement_id.clone());
+                    gone = true;
+                    nudges = n;
+                }
+                Err(e) => undo.skipped.push(Skipped {
+                    transaction_id: replacement_id.clone(),
+                    reason: e.to_string(),
+                }),
+            },
+            (Some(_), None) if deletable => {
+                // check_replacement returns the row for every non-missing state; reaching
+                // here is a programming error, so say so rather than deleting blind.
+                tracing::error!("undo replace: deletable row without its detail; skipping");
+                undo.skipped.push(Skipped {
+                    transaction_id: replacement_id.clone(),
+                    reason: "internal: row detail missing; re-run the undo".to_string(),
+                });
             }
-            Some(RowState::Reconciled | RowState::ChangedSinceCreated { .. }) if force => {
-                self.delete_for_undo(&replacement_id, &mut undo, &mut gone)
-                    .await;
-            }
-            Some(_) => undo.skipped.push(Skipped {
+            (Some(_), _) => undo.skipped.push(Skipped {
                 transaction_id: replacement_id.clone(),
                 reason: "flagged in preview; pass force to delete anyway".to_string(),
             }),
@@ -919,21 +1073,9 @@ impl YnabServer {
             "missing_already_gone": undo.missing,
             "skipped": undo.skipped,
             "recreated_transaction_id": undo.recreated_transaction_id,
+            "recompute_nudges": nudges,
             "status": if open { "partially_undone" } else { "undone" },
         }))
-    }
-
-    async fn delete_for_undo(&self, id: &str, undo: &mut UndoRecord, gone: &mut bool) {
-        match self.client().delete_transaction(id).await {
-            Ok(()) => {
-                undo.deleted.push(id.to_string());
-                *gone = true;
-            }
-            Err(e) => undo.skipped.push(Skipped {
-                transaction_id: id.to_string(),
-                reason: e.to_string(),
-            }),
-        }
     }
 
     pub(crate) async fn undo_assign(
@@ -1221,6 +1363,32 @@ mod tests {
         let mut edited = t.clone();
         edited.subtransactions[1].amount = -46_000;
         assert!(!row_matches_snapshot(&edited, &snap));
+    }
+
+    #[test]
+    fn month_of_and_leg_categories() {
+        assert_eq!(month_of("2026-07-27").as_deref(), Some("2026-07-01"));
+        assert!(month_of("July").is_none());
+        let mut t = original();
+        assert!(leg_categories(&t).is_empty(), "non-split has no legs");
+        let leg = |cat: Option<&str>, deleted: bool| crate::ynab::SubTransaction {
+            amount: 1,
+            memo: None,
+            payee_id: None,
+            payee_name: None,
+            category_id: cat.map(str::to_string),
+            category_name: None,
+            transfer_account_id: None,
+            deleted,
+        };
+        t.subtransactions = vec![
+            leg(Some("rta"), false),
+            leg(Some("fees"), false),
+            leg(Some("rta"), false),
+            leg(Some("gone"), true),
+            leg(None, false),
+        ];
+        assert_eq!(leg_categories(&t), vec!["rta", "fees"]);
     }
 
     fn change(month: &str, cat: &str, amount: f64) -> AssignChangeArg {

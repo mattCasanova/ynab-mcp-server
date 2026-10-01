@@ -154,10 +154,23 @@ phases:
    `force=true`. `missing` rows are recorded as resolved. A write stays open until every part
    is reversed, so re-running is safe.
 
+**Deleting a split through the API leaves stale month totals** (observed 2026-10-01): the row
+and the account balance update, but each leg's category keeps counting the leg until some write
+that references that category lands. A plain delete recomputes fine. So after any split
+delete the server nudges every leg category by creating a zero-amount row in it and deleting
+it again (re-writing the assigned amount unchanged does nothing). Every tool that deletes
+reports what it nudged under `recompute_nudges`; a failed nudge is reported, never hidden.
+
 `replace_transaction` creates before it deletes, so a failure can never leave money missing
 from the account. If the delete fails after the create, both rows exist; the tool says so
 loudly with both ids and the replace is still undoable. YNAB cannot change the category of an
 existing split, which is why replace is create-then-delete rather than an update.
+
+**Import ids stay reserved after a delete.** `create_transactions` and `import_bank_csv` give
+every row an `import_id` of `YNAB:<milliunits>:<date>:<n>` so a re-run cannot double-enter. YNAB
+keeps that id reserved even after the row is deleted, so once a row has been undone, creating
+the same amount on the same day again is reported under `skipped_duplicate_import_ids` and
+nothing is journaled. Enter that one by hand in YNAB, or change the amount or date.
 
 ## Files in and out
 
