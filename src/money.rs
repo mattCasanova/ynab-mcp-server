@@ -5,8 +5,9 @@ pub type Milliunits = i64;
 
 /// Format milliunits as a decimal string with two places, e.g. -12340 -> "-12.34".
 pub fn to_decimal(m: Milliunits) -> String {
-    let sign = if m < 0 { "-" } else { "" };
     let cents = (m.abs() + 5) / 10;
+    // A value that rounds to zero is "0.00", never "-0.00".
+    let sign = if m < 0 && cents > 0 { "-" } else { "" };
     format!("{sign}{}.{:02}", cents / 100, cents % 100)
 }
 
@@ -29,6 +30,12 @@ mod tests {
         assert_eq!(to_decimal(5000), "5.00");
         assert_eq!(to_decimal(10), "0.01");
         assert_eq!(to_decimal(0), "0.00");
+        assert_eq!(
+            to_decimal(-1),
+            "0.00",
+            "sub-cent negatives are not minus zero"
+        );
+        assert_eq!(to_decimal(-5), "-0.01");
     }
 
     #[test]
