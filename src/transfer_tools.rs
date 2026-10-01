@@ -532,6 +532,7 @@ impl YnabServer {
                 payee_name: Some(r.description.clone()),
                 category_id: args.category_id.clone(),
                 memo: None,
+                subtransactions: None,
             })
             .collect();
         let created = self

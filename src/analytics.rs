@@ -363,6 +363,8 @@ mod tests {
                 category_id: Some("g".into()),
                 category_name: Some("Groceries".into()),
                 transfer_account_id: None,
+                payee_id: None,
+                deleted: false,
             },
             SubTransaction {
                 amount: -10000,
@@ -371,6 +373,8 @@ mod tests {
                 category_id: Some("h".into()),
                 category_name: Some("Household".into()),
                 transfer_account_id: None,
+                payee_id: None,
+                deleted: false,
             },
         ];
         let mut transfer = txn("t", "2026-09-02", -50000, "Transfer : Savings", "x");

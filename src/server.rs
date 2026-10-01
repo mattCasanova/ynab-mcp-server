@@ -12,7 +12,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::cache::MonthCache;
-use crate::journal::{self, BatchRecord, BatchState, Journal, Op, Record, Skipped, UndoRecord};
+use crate::edit_tools::{SplitLineArg, split_lines};
+use crate::journal::{
+    self, BatchRecord, BatchState, Journal, LockedJournal, Op, Record, Skipped, UndoRecord,
+    WriteState,
+};
 use crate::money::{from_decimal, to_decimal};
 use crate::reconcile::{self, BankRow, YnabRow};
 use crate::ynab::{self, Client, SaveTransaction, TransactionFilter, TransactionKind, YnabError};
@@ -45,7 +49,60 @@ impl YnabServer {
         self.allow_writes
     }
 
-    async fn month_cache(&self) -> Result<&MonthCache, McpError> {
+    pub(crate) fn journal(&self) -> &Journal {
+        &self.journal
+    }
+
+    /// The gate every write tool checks first, even though write tools are only registered
+    /// when writes are on: belt and braces.
+    pub(crate) fn require_writes(&self) -> Result<(), McpError> {
+        if self.allow_writes {
+            Ok(())
+        } else {
+            Err(invalid(
+                "writes are disabled on this server (YNAB_MCP_ALLOW_WRITES)",
+            ))
+        }
+    }
+
+    /// Drop months from the cache after a write changed their numbers. Failures are logged and
+    /// counted, never fatal: the write already happened. Returns the months actually dropped.
+    pub(crate) async fn invalidate_months(&self, months: &[String]) -> Vec<String> {
+        let mut distinct: Vec<&String> = months.iter().collect();
+        distinct.sort();
+        distinct.dedup();
+        let cache = match self.month_cache().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = ?e, "could not open the month cache to invalidate it");
+                return Vec::new();
+            }
+        };
+        let mut dropped = Vec::new();
+        for month in distinct {
+            let Some(date) = reconcile::parse_date(month) else {
+                tracing::error!(
+                    month,
+                    "invalidate: month does not parse; cache may be stale"
+                );
+                continue;
+            };
+            match cache.invalidate(date) {
+                Ok(true) => dropped.push(month.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::error!(
+                        month,
+                        error = format!("{e:#}"),
+                        "invalidate: could not remove cached month"
+                    )
+                }
+            }
+        }
+        dropped
+    }
+
+    pub(crate) async fn month_cache(&self) -> Result<&MonthCache, McpError> {
         self.month_cache
             .get_or_try_init(|| async {
                 let plan = self.client.resolve_plan_id().await.map_err(api_error)?;
@@ -87,7 +144,8 @@ impl YnabServer {
             + Self::history_router()
             + Self::diag_router();
         if allow_writes {
-            tool_router += Self::write_router() + Self::transfer_write_router();
+            tool_router +=
+                Self::write_router() + Self::transfer_write_router() + Self::edit_write_router();
         }
         Self {
             client: Arc::new(client),
@@ -113,7 +171,7 @@ pub(crate) fn client_name(ctx: &RequestContext<RoleServer>) -> Option<String> {
 
 /// Every error handed back to the model is also logged, so the local log has the full story
 /// even when the agent moves on.
-fn journal_error(e: anyhow::Error) -> McpError {
+pub(crate) fn journal_error(e: anyhow::Error) -> McpError {
     tracing::error!(error = format!("{e:#}"), "journal failure");
     McpError::internal_error(format!("journal: {e:#}"), None)
 }
@@ -207,9 +265,12 @@ pub struct NewTransactionArg {
     pub amount: f64,
     /// Payee name; YNAB resolves or creates it.
     pub payee_name: Option<String>,
-    /// Category id from list_categories. Leave unset to land uncategorized.
+    /// Category id from list_categories. Leave unset to land uncategorized. Must be unset
+    /// when subtransactions is given.
     pub category_id: Option<String>,
     pub memo: Option<String>,
+    /// Split lines (2 or more) that sum exactly to amount. Each carries its own category.
+    pub subtransactions: Option<Vec<SplitLineArg>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -528,21 +589,21 @@ impl YnabServer {
 #[tool_router(router = history_router, vis = "pub")]
 impl YnabServer {
     #[tool(
-        description = "Every write batch this server (any agent, any session) has made, newest first, with status open | partially_undone | undone. Use the batch_id with undo_batch."
+        description = "Every write this server (any agent, any session) has made, newest first: kind batch (rows created), replace, or assign, with status open | partially_undone | undone. Use the batch_id with undo_batch."
     )]
     async fn list_write_history(
         &self,
         Parameters(args): Parameters<ListWriteHistoryArgs>,
     ) -> Result<CallToolResult, McpError> {
         let mut locked = self.journal.lock().map_err(journal_error)?;
-        let mut batches = locked.batches().map_err(journal_error)?;
+        let mut writes = locked.writes().map_err(journal_error)?;
         drop(locked);
-        batches.reverse();
-        let rows: Vec<_> = batches
+        writes.reverse();
+        let rows: Vec<_> = writes
             .iter()
-            .filter(|b| !args.open_only || !b.remaining.is_empty())
+            .filter(|w| !args.open_only || w.is_open())
             .take(args.limit.unwrap_or(20))
-            .map(batch_json)
+            .map(write_json)
             .collect();
         json_result(
             &json!({ "journal": self.journal.path().display().to_string(), "batches": rows }),
@@ -576,7 +637,7 @@ impl YnabServer {
 #[tool_router(router = write_router, vis = "pub")]
 impl YnabServer {
     #[tool(
-        description = "WRITE. Undo one batch from list_write_history by deleting the transactions it created. Rows reconciled in YNAB since are skipped unless force. Safe to re-run; already-undone rows are never touched twice."
+        description = "WRITE. Undo one write from list_write_history: a batch by deleting the rows it created, a replace by deleting the replacement and re-creating the original, an assign by setting the amounts back. Anything reconciled or changed since is skipped unless force. Safe to re-run; already-undone parts are never touched twice."
     )]
     async fn undo_batch(
         &self,
@@ -593,7 +654,7 @@ impl YnabServer {
     }
 
     #[tool(
-        description = "WRITE. Undo the most recent batch that still has something to undo. Same rules as undo_batch."
+        description = "WRITE. Undo the most recent write of any kind that still has something to undo. Same rules as undo_batch."
     )]
     async fn undo_last(
         &self,
@@ -605,7 +666,7 @@ impl YnabServer {
     }
 
     #[tool(
-        description = "WRITE. Create transactions in bulk. Each gets an import_id (YNAB:amount:date:n) so re-running never double-enters, and lands unapproved for review in YNAB."
+        description = "WRITE. Create transactions in bulk, single-category or split (subtransactions that sum to amount). Each gets an import_id (YNAB:amount:date:n) so re-running never double-enters, and lands unapproved for review in YNAB."
     )]
     async fn create_transactions(
         &self,
@@ -639,22 +700,33 @@ impl YnabServer {
         let mut occurrences: std::collections::HashMap<(i64, String), u32> = Default::default();
         let saves: Vec<SaveTransaction> = rows
             .iter()
-            .map(|t| {
+            .enumerate()
+            .map(|(i, t)| {
                 reconcile::parse_date(&t.date)
                     .ok_or_else(|| invalid(format!("unparseable date: {}", t.date)))?;
                 let amount = from_decimal(t.amount);
+                let subtransactions = match &t.subtransactions {
+                    None => None,
+                    Some(lines) => Some(
+                        split_lines(amount, t.category_id.as_deref(), lines)
+                            .map_err(|e| invalid(format!("transactions[{i}]: {e}")))?,
+                    ),
+                };
                 let n = occurrences.entry((amount, t.date.clone())).or_insert(0);
                 *n += 1;
                 Ok(SaveTransaction {
                     account_id: t.account_id.clone(),
                     date: t.date.clone(),
                     amount,
+                    payee_id: None,
                     payee_name: t.payee_name.clone(),
                     category_id: t.category_id.clone(),
                     memo: t.memo.clone(),
-                    cleared: "uncleared",
+                    cleared: "uncleared".to_string(),
                     approved: false,
-                    import_id: format!("YNAB:{amount}:{}:{n}", t.date),
+                    flag_color: None,
+                    import_id: Some(format!("YNAB:{amount}:{}:{n}", t.date)),
+                    subtransactions,
                 })
             })
             .collect::<Result<Vec<_>, McpError>>()?;
@@ -748,7 +820,7 @@ impl YnabServer {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-enum RowState {
+pub(crate) enum RowState {
     Deletable,
     /// Not in YNAB any more; the journal is the only record left.
     Missing {
@@ -850,33 +922,33 @@ impl YnabServer {
         client: Option<String>,
     ) -> Result<CallToolResult, McpError> {
         let mut locked = self.journal.lock().map_err(journal_error)?;
-        let batches = locked.batches().map_err(journal_error)?;
-        let state = match &batch_id {
-            Some(id) => batches
-                .iter()
-                .find(|b| &b.batch.batch_id == id)
-                .ok_or_else(|| invalid(format!("no batch {id} in the journal")))?,
-            None => batches
-                .iter()
-                .rev()
-                .find(|b| !b.remaining.is_empty())
-                .ok_or_else(|| invalid("nothing left to undo"))?,
-        };
-        if state.remaining.is_empty() {
-            return Err(invalid(format!(
-                "batch {} is already fully undone",
-                state.batch.batch_id
-            )));
+        let writes = locked.writes().map_err(journal_error)?;
+        let state = journal::select_for_undo(&writes, batch_id.as_deref(), self.client.plan_id())
+            .map_err(invalid)?;
+        match state {
+            WriteState::Batch(batch) => {
+                self.undo_batch_rows(batch, confirm, force, client, &mut locked)
+                    .await
+            }
+            WriteState::Replace(replace) => {
+                self.undo_replace(replace, confirm, force, client, &mut locked)
+                    .await
+            }
+            WriteState::Assign(assign) => {
+                self.undo_assign(assign, confirm, force, client, &mut locked)
+                    .await
+            }
         }
-        if state.batch.plan_id != self.client.plan_id() {
-            return Err(invalid(format!(
-                "batch {} belongs to plan {}, this server is on plan {}",
-                state.batch.batch_id,
-                state.batch.plan_id,
-                self.client.plan_id()
-            )));
-        }
+    }
 
+    async fn undo_batch_rows(
+        &self,
+        state: &BatchState,
+        confirm: bool,
+        force: bool,
+        client: Option<String>,
+        locked: &mut LockedJournal,
+    ) -> Result<CallToolResult, McpError> {
         let plan = self.plan_undo(state).await?;
         let flagged = plan
             .rows
@@ -904,6 +976,7 @@ impl YnabServer {
             };
             return json_result(&json!({
                 "batch_id": plan.batch.batch.batch_id,
+                "kind": "batch",
                 "preview_only": true,
                 "would_delete": plan.rows.iter().filter(|(_, s)| matches!(s, RowState::Deletable)).count(),
                 "flagged": flagged,
@@ -912,14 +985,7 @@ impl YnabServer {
             }));
         }
 
-        let mut undo = UndoRecord {
-            batch_id: plan.batch.batch.batch_id.clone(),
-            at: journal::now(),
-            client,
-            deleted: Vec::new(),
-            missing: Vec::new(),
-            skipped: Vec::new(),
-        };
+        let mut undo = UndoRecord::new(plan.batch.batch.batch_id.clone(), client);
         for (op, row_state) in &plan.rows {
             let id = op.transaction_id.clone();
             let delete = match row_state {
@@ -952,6 +1018,7 @@ impl YnabServer {
         let remaining = plan.rows.len() - undo.deleted.len() - undo.missing.len();
         json_result(&json!({
             "batch_id": undo.batch_id,
+            "kind": "batch",
             "deleted": undo.deleted,
             "missing_already_gone": undo.missing,
             "skipped": undo.skipped,
@@ -960,27 +1027,64 @@ impl YnabServer {
     }
 }
 
-fn batch_json(b: &BatchState) -> serde_json::Value {
-    let total: i64 = b.batch.ops.iter().map(|op| op.amount).sum();
-    json!({
-        "batch_id": b.batch.batch_id,
-        "at": b.batch.at,
-        "tool": b.batch.tool,
-        "client": b.batch.client,
-        "status": b.status(),
-        "ops": b.batch.ops.len(),
-        "remaining": b.remaining.len(),
-        "total_amount": to_decimal(total),
-        "undos": b.undos.len(),
-        "transactions": b.batch.ops.iter().map(|op| json!({
-            "id": op.transaction_id,
-            "date": op.date,
-            "amount": to_decimal(op.amount),
-            "payee": op.payee_name,
-            "account_id": op.account_id,
-            "undone": !b.remaining.iter().any(|r| r.transaction_id == op.transaction_id),
-        })).collect::<Vec<_>>(),
-    })
+fn write_json(w: &WriteState) -> serde_json::Value {
+    let mut value = json!({
+        "batch_id": w.batch_id(),
+        "at": w.at(),
+        "tool": w.tool(),
+        "client": w.client(),
+        "status": w.status(),
+        "undos": w.undos().len(),
+    });
+    let detail = match w {
+        WriteState::Batch(b) => {
+            let total: i64 = b.batch.ops.iter().map(|op| op.amount).sum();
+            json!({
+                "kind": "batch",
+                "ops": b.batch.ops.len(),
+                "remaining": b.remaining.len(),
+                "total_amount": to_decimal(total),
+                "transactions": b.batch.ops.iter().map(|op| json!({
+                    "id": op.transaction_id,
+                    "date": op.date,
+                    "amount": to_decimal(op.amount),
+                    "payee": op.payee_name,
+                    "account_id": op.account_id,
+                    "undone": !b.remaining.iter().any(|r| r.transaction_id == op.transaction_id),
+                })).collect::<Vec<_>>(),
+            })
+        }
+        WriteState::Replace(r) => json!({
+            "kind": "replace",
+            "original_transaction_id": r.record.original.transaction_id,
+            "replacement_transaction_id": r.record.replacement.transaction_id,
+            "date": r.record.original.date,
+            "amount": to_decimal(r.record.original.amount),
+            "payee": r.record.original.payee_name,
+            "account_id": r.record.original.account_id,
+            "original_deleted": r.record.original_deleted,
+            "replacement_gone": r.replacement_gone,
+            "original_restored": r.original_restored,
+            "recreated_transaction_id": r.undos.iter().rev().find_map(|u| u.recreated_transaction_id.clone()),
+        }),
+        WriteState::Assign(a) => json!({
+            "kind": "assign",
+            "ops": a.record.ops.len(),
+            "remaining": a.remaining.len(),
+            "assignments": a.record.ops.iter().map(|op| json!({
+                "month": op.month,
+                "category_id": op.category_id,
+                "category": op.category_name,
+                "assigned_before": to_decimal(op.old_budgeted),
+                "assigned_after": to_decimal(op.new_budgeted),
+                "undone": !a.remaining.iter().any(|r| r.key() == op.key()),
+            })).collect::<Vec<_>>(),
+        }),
+    };
+    if let (Some(base), Some(extra)) = (value.as_object_mut(), detail.as_object()) {
+        base.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    value
 }
 
 fn category_json(c: &ynab::Category) -> serde_json::Value {
@@ -1002,7 +1106,7 @@ fn category_json(c: &ynab::Category) -> serde_json::Value {
     })
 }
 
-fn transaction_json(t: &ynab::Transaction) -> serde_json::Value {
+pub(crate) fn transaction_json(t: &ynab::Transaction) -> serde_json::Value {
     json!({
         "id": t.id,
         "date": t.date,
@@ -1019,10 +1123,11 @@ fn transaction_json(t: &ynab::Transaction) -> serde_json::Value {
         "approved": t.approved,
         "flag": t.flag_color,
         "transfer_account_id": t.transfer_account_id,
-        "splits": t.subtransactions.iter().map(|s| json!({
+        "splits": t.subtransactions.iter().filter(|s| !s.deleted).map(|s| json!({
             "amount": to_decimal(s.amount),
             "payee": s.payee_name,
             "category": s.category_name,
+            "category_id": s.category_id,
             "memo": s.memo,
         })).collect::<Vec<_>>(),
     })
@@ -1048,7 +1153,7 @@ fn ynab_row_json(r: &YnabRow) -> serde_json::Value {
 impl ServerHandler for YnabServer {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.allow_writes {
-            "Writes are ENABLED: create_transactions lands rows unapproved and journals every batch; undo_batch / undo_last reverse them."
+            "Writes are ENABLED: create_transactions (single or split) lands rows unapproved, replace_transaction reshapes a row at the same total, assign_money moves money by month; every write is journaled and undo_batch / undo_last reverse them. Preview first (confirm=false), show the user, then confirm."
         } else {
             "Read-only: no tool can change the plan."
         };

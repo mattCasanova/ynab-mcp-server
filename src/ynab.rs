@@ -135,14 +135,17 @@ struct MonthData {
     month: MonthDetail,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SubTransaction {
     pub amount: Milliunits,
     pub memo: Option<String>,
+    pub payee_id: Option<String>,
     pub payee_name: Option<String>,
     pub category_id: Option<String>,
     pub category_name: Option<String>,
     pub transfer_account_id: Option<String>,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,7 +164,7 @@ struct MoneyMovementsData {
 }
 
 /// Covers both TransactionDetail and HybridTransaction (category/payee endpoints).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Transaction {
     pub id: String,
     pub date: String,
@@ -189,6 +192,16 @@ struct TransactionsData {
 }
 
 #[derive(Debug, Deserialize)]
+struct TransactionData {
+    transaction: Transaction,
+}
+
+#[derive(Debug, Deserialize)]
+struct CategoryData {
+    category: Category,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct ScheduledTransaction {
     pub id: String,
     pub date_first: String,
@@ -207,17 +220,53 @@ struct ScheduledTransactionsData {
     scheduled_transactions: Vec<ScheduledTransaction>,
 }
 
-#[derive(Debug, Serialize)]
+/// One leg of a split. Legs must sum exactly to the parent amount; YNAB rejects otherwise.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SaveSubTransaction {
+    pub amount: Milliunits,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payee_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payee_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SaveTransaction {
     pub account_id: String,
     pub date: String,
     pub amount: Milliunits,
+    /// Wins over `payee_name` when both are set (YNAB's rule); used to keep the exact payee
+    /// on a replacement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payee_id: Option<String>,
     pub payee_name: Option<String>,
+    /// Must be None when `subtransactions` is set.
     pub category_id: Option<String>,
     pub memo: Option<String>,
-    pub cleared: &'static str,
+    /// "uncleared" | "cleared" | "reconciled".
+    pub cleared: String,
     pub approved: bool,
-    pub import_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flag_color: Option<String>,
+    /// None on replacements: a repeated import_id is treated by YNAB as a duplicate and dropped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subtransactions: Option<Vec<SaveSubTransaction>>,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchMonthCategory {
+    category: PatchBudgeted,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchBudgeted {
+    budgeted: Milliunits,
 }
 
 #[derive(Debug, Serialize)]
@@ -416,6 +465,48 @@ impl Client {
             .get(self.plan_url(&format!("/months/{month}")), &[])
             .await?;
         Ok(data.month)
+    }
+
+    /// One transaction by id, with its subtransactions. 404 when it does not exist.
+    pub async fn transaction(&self, transaction_id: &str) -> Result<Transaction, YnabError> {
+        let data: TransactionData = self
+            .get(
+                self.plan_url(&format!("/transactions/{transaction_id}")),
+                &[],
+            )
+            .await?;
+        Ok(data.transaction)
+    }
+
+    /// One category's numbers for one month (`YYYY-MM-01`).
+    pub async fn month_category(
+        &self,
+        month: &str,
+        category_id: &str,
+    ) -> Result<Category, YnabError> {
+        let data: CategoryData = self
+            .get(
+                self.plan_url(&format!("/months/{month}/categories/{category_id}")),
+                &[],
+            )
+            .await?;
+        Ok(data.category)
+    }
+
+    /// Set the ABSOLUTE assigned amount for a category in a month. Callers that want a
+    /// delta read the current value first and add to it.
+    pub async fn update_month_category(
+        &self,
+        month: &str,
+        category_id: &str,
+        budgeted: Milliunits,
+    ) -> Result<Category, YnabError> {
+        let body = PatchMonthCategory {
+            category: PatchBudgeted { budgeted },
+        };
+        let url = self.plan_url(&format!("/months/{month}/categories/{category_id}"));
+        let data: CategoryData = self.send(self.http.patch(url).json(&body)).await?;
+        Ok(data.category)
     }
 
     pub async fn transactions(

@@ -4,6 +4,7 @@ mod cache;
 mod config;
 mod csvio;
 mod diag;
+mod edit_tools;
 mod journal;
 mod money;
 mod paths;

@@ -133,6 +133,17 @@ impl MonthCache {
         Ok(())
     }
 
+    /// Drop one month so the next read is live. Used after a write that changes a past
+    /// month's numbers. Returns whether a cached file was there.
+    pub fn invalidate(&self, month: NaiveDate) -> Result<bool> {
+        let path = self.path_for(month);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+        }
+    }
+
     pub fn count(&self) -> usize {
         std::fs::read_dir(&self.dir)
             .map(|d| {
@@ -240,6 +251,20 @@ mod tests {
             c.get(d("2026-08-01"), today, now + chrono::Duration::hours(25))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn invalidate_drops_one_month_and_leaves_the_rest() {
+        let c = cache("invalidate", 30);
+        let today = d("2026-09-30");
+        let now = Utc::now();
+        c.put(d("2026-06-01"), today, now, &detail("2026-06-01"));
+        c.put(d("2026-07-01"), today, now, &detail("2026-07-01"));
+        assert!(c.invalidate(d("2026-06-01")).unwrap());
+        assert!(c.get(d("2026-06-01"), today, now).is_none());
+        assert!(c.get(d("2026-07-01"), today, now).is_some());
+        assert!(!c.invalidate(d("2026-06-01")).unwrap(), "already gone");
+        assert!(!c.invalidate(d("2026-09-01")).unwrap(), "never cached");
     }
 
     #[test]
