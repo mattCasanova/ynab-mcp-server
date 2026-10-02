@@ -555,7 +555,30 @@ impl YnabServer {
             .await
             .map_err(api_error)?;
         tracing::info!(count = ids.len(), "linked-account import triggered");
-        json_result(&json!({ "imported": ids.len(), "transaction_ids": ids }))
+        // The API returns ids only, so the months touched are unknown: drop the whole cache.
+        let cleared = if ids.is_empty() {
+            0
+        } else {
+            match self.month_cache().await.map(|c| c.clear()) {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => {
+                    tracing::error!(
+                        error = format!("{e:#}"),
+                        "import: could not clear the month cache; later reads may be stale"
+                    );
+                    0
+                }
+                Err(e) => {
+                    tracing::error!(error = ?e, "import: could not open the month cache; later reads may be stale");
+                    0
+                }
+            }
+        };
+        json_result(&json!({
+            "imported": ids.len(),
+            "transaction_ids": ids,
+            "cached_months_cleared": cleared,
+        }))
     }
 }
 

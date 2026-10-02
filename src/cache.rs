@@ -133,15 +133,39 @@ impl MonthCache {
         Ok(())
     }
 
-    /// Drop one month so the next read is live. Used after a write that changes a past
-    /// month's numbers. Returns whether a cached file was there.
-    pub fn invalidate(&self, month: NaiveDate) -> Result<bool> {
-        let path = self.path_for(month);
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(e).with_context(|| format!("remove {}", path.display())),
+    /// Drop `month` and every later cached month, so the next reads are live. A write dated in
+    /// month M changes M and, because YNAB balances carry forward, every month after it.
+    /// Returns the months removed, oldest first. Files that are not `YYYY-MM-DD.json` (a
+    /// half-written `.json.tmp`, anything a person dropped in) are left alone.
+    pub fn invalidate_from(&self, month: NaiveDate) -> Result<Vec<NaiveDate>> {
+        let from = month.with_day(1).expect("day 1 exists in every month");
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("read {}", self.dir.display())),
+        };
+        let mut removed = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_none_or(|x| x != "json") {
+                continue;
+            }
+            let Some(cached) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            else {
+                tracing::warn!(path = %path.display(), "month cache holds a file that is not a month; leaving it");
+                continue;
+            };
+            if cached >= from {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("remove {}", path.display()))?;
+                removed.push(cached);
+            }
         }
+        removed.sort_unstable();
+        Ok(removed)
     }
 
     pub fn count(&self) -> usize {
@@ -254,17 +278,44 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_drops_one_month_and_leaves_the_rest() {
+    fn invalidate_from_drops_the_month_and_every_later_one() {
         let c = cache("invalidate", 30);
-        let today = d("2026-09-30");
+        let today = d("2026-12-15");
         let now = Utc::now();
-        c.put(d("2026-06-01"), today, now, &detail("2026-06-01"));
-        c.put(d("2026-07-01"), today, now, &detail("2026-07-01"));
-        assert!(c.invalidate(d("2026-06-01")).unwrap());
-        assert!(c.get(d("2026-06-01"), today, now).is_none());
-        assert!(c.get(d("2026-07-01"), today, now).is_some());
-        assert!(!c.invalidate(d("2026-06-01")).unwrap(), "already gone");
-        assert!(!c.invalidate(d("2026-09-01")).unwrap(), "never cached");
+        for m in ["2026-05-01", "2026-06-01", "2026-07-01", "2026-09-01"] {
+            c.put(d(m), today, now, &detail(m));
+        }
+        std::fs::write(c.dir().join("notes.json"), "{}").unwrap();
+        std::fs::write(c.dir().join("2026-08-01.json.tmp"), "{}").unwrap();
+
+        let removed = c.invalidate_from(d("2026-07-15")).unwrap();
+        assert_eq!(
+            removed,
+            vec![d("2026-07-01"), d("2026-09-01")],
+            "mid-month argument counts from the 1st"
+        );
+        assert!(
+            c.get(d("2026-05-01"), today, now).is_some(),
+            "earlier months stay"
+        );
+        assert!(c.get(d("2026-06-01"), today, now).is_some());
+        assert!(c.get(d("2026-07-01"), today, now).is_none());
+        assert!(c.get(d("2026-09-01"), today, now).is_none());
+        assert!(
+            c.dir().join("notes.json").exists(),
+            "non-month files untouched"
+        );
+        assert!(c.dir().join("2026-08-01.json.tmp").exists());
+        assert!(
+            c.invalidate_from(d("2026-07-01")).unwrap().is_empty(),
+            "already gone"
+        );
+    }
+
+    #[test]
+    fn invalidate_from_with_no_cache_dir_is_empty_not_an_error() {
+        let c = cache("invalidate-none", 30);
+        assert!(c.invalidate_from(d("2026-01-01")).unwrap().is_empty());
     }
 
     #[test]

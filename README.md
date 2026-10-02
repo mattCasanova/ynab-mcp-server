@@ -33,7 +33,7 @@ Plan and use cases: `~/workspace/ynab/ynab-mcp-plan.md`.
 | `diagnostic_report` | redacted local diagnostics + a prefilled GitHub issue link; sends nothing |
 | `create_transactions` | **write, gated** by `YNAB_MCP_ALLOW_WRITES=1`; single-category or split (`subtransactions` that sum to `amount`); dedupe `import_id`, lands unapproved, journaled |
 | `replace_transaction` | **write, gated.** Reshape one row to a new category or new split lines at the same account, date, payee, and total; creates the replacement, then deletes the original. Preview, then `confirm`; a reconciled original needs `force` |
-| `assign_money` | **write, gated.** Per-month deltas on categories' assigned amounts (+ from Ready to Assign, − back to it). Preview shows before/after per category and per month; `confirm` applies; a month going negative needs `force`. Touched months leave the cache |
+| `assign_money` | **write, gated.** Per-month deltas on categories' assigned amounts (+ from Ready to Assign, − back to it). Preview shows before/after per category and per month; `confirm` applies; a month going negative needs `force` |
 | `undo_batch`, `undo_last` | **write, gated.** Two-phase: preview first, then `confirm=true`. Flagged rows also need `force`. Works on every write kind |
 
 Amounts are decimal strings in the plan currency; outflows are negative.
@@ -206,9 +206,12 @@ disk under `~/.local/share/ynab-mcp/cache/<plan id>/months/`:
 - the previous month is cached for one day (you are usually still reconciling it);
 - older months are cached for `cache_ttl_days` (default 30; `0` disables).
 
-`status` shows how many months are cached, `goal_analysis` reports live vs cached calls, and
-`ynab-mcp cache clear` throws the cache away (it is refetched on demand). If you edit an old
-month in YNAB and want the tools to see it now, clear the cache.
+Every write through the server drops the earliest month it touched and every later month,
+because YNAB balances carry forward; each write tool reports them under
+`months_dropped_from_cache`. `status` shows how many months are cached, `goal_analysis` reports
+live vs cached calls, and `ynab-mcp cache clear` throws the cache away (it is refetched on
+demand). If you edit an old month in the YNAB app and want the tools to see it now, clear the
+cache.
 
 ## Errors, logs, and filing an issue
 

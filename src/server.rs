@@ -65,41 +65,31 @@ impl YnabServer {
         }
     }
 
-    /// Drop months from the cache after a write changed their numbers. Failures are logged and
-    /// counted, never fatal: the write already happened. Returns the months actually dropped.
-    pub(crate) async fn invalidate_months(&self, months: &[String]) -> Vec<String> {
-        let mut distinct: Vec<&String> = months.iter().collect();
-        distinct.sort();
-        distinct.dedup();
+    /// After a write: drop the earliest touched month and every later one from the cache,
+    /// since YNAB balances carry forward. Call it once, after the tool's last API write.
+    /// Failures are logged, never fatal: the write already happened. Returns the months
+    /// dropped (`YYYY-MM-01`), oldest first.
+    pub(crate) async fn invalidate_cache_from(&self, months: &[String]) -> Vec<String> {
+        let Some(from) = earliest_month(months) else {
+            return Vec::new();
+        };
         let cache = match self.month_cache().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(error = ?e, "could not open the month cache to invalidate it");
+                tracing::error!(error = ?e, "could not open the month cache to invalidate it; later reads may be stale");
                 return Vec::new();
             }
         };
-        let mut dropped = Vec::new();
-        for month in distinct {
-            let Some(date) = reconcile::parse_date(month) else {
+        match cache.invalidate_from(from) {
+            Ok(removed) => removed.iter().map(|d| d.to_string()).collect(),
+            Err(e) => {
                 tracing::error!(
-                    month,
-                    "invalidate: month does not parse; cache may be stale"
+                    error = format!("{e:#}"),
+                    "invalidate: could not clear the month cache; later reads may be stale"
                 );
-                continue;
-            };
-            match cache.invalidate(date) {
-                Ok(true) => dropped.push(month.clone()),
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::error!(
-                        month,
-                        error = format!("{e:#}"),
-                        "invalidate: could not remove cached month"
-                    )
-                }
+                Vec::new()
             }
         }
-        dropped
     }
 
     pub(crate) async fn month_cache(&self) -> Result<&MonthCache, McpError> {
@@ -156,6 +146,21 @@ impl YnabServer {
             tool_router,
         }
     }
+}
+
+/// The earliest parseable month among `months`. An unparseable one is a bug in the caller
+/// (every write path builds these from YNAB dates), so it is logged and skipped.
+pub(crate) fn earliest_month(months: &[String]) -> Option<chrono::NaiveDate> {
+    months
+        .iter()
+        .filter_map(|m| {
+            let parsed = reconcile::parse_date(m);
+            if parsed.is_none() {
+                tracing::error!(month = %m, "cache invalidation got an unparseable month; skipping it");
+            }
+            parsed
+        })
+        .min()
 }
 
 pub(crate) fn client_name(ctx: &RequestContext<RoleServer>) -> Option<String> {
@@ -756,7 +761,7 @@ impl YnabServer {
             .iter()
             .filter_map(|t| crate::edit_tools::month_of(&t.date))
             .collect();
-        let dropped = self.invalidate_months(&months).await;
+        let dropped = self.invalidate_cache_from(&months).await;
         let ops: Vec<Op> = result
             .transactions
             .iter()
@@ -1053,6 +1058,13 @@ impl YnabServer {
                 }),
             }
         }
+        let touched: Vec<String> = plan
+            .rows
+            .iter()
+            .filter(|(op, _)| undo.deleted.contains(&op.transaction_id))
+            .filter_map(|(op, _)| crate::edit_tools::month_of(&op.date))
+            .collect();
+        let dropped = self.invalidate_cache_from(&touched).await;
         locked
             .append(&Record::Undo(undo.clone()))
             .map_err(journal_error)?;
@@ -1065,6 +1077,7 @@ impl YnabServer {
             "skipped": undo.skipped,
             "remaining_in_batch": remaining,
             "recompute_nudges": nudges,
+            "months_dropped_from_cache": dropped,
         }))
     }
 }
@@ -1206,5 +1219,26 @@ impl ServerHandler for YnabServer {
                  Call list_accounts first to get account ids. Use reconcile_account for bank-vs-YNAB diffs \
                  instead of comparing rows yourself. {mode}"
             ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn earliest_month_picks_the_minimum_and_skips_garbage() {
+        let months = vec![
+            "2026-08-01".to_string(),
+            "not a month".to_string(),
+            "2026-06-01".to_string(),
+            "2026-07-01".to_string(),
+        ];
+        assert_eq!(
+            earliest_month(&months),
+            chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+        );
+        assert_eq!(earliest_month(&[]), None);
+        assert_eq!(earliest_month(&["junk".to_string()]), None);
     }
 }

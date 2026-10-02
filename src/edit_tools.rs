@@ -541,6 +541,7 @@ pub(crate) fn leg_categories(t: &Transaction) -> Vec<String> {
 impl YnabServer {
     /// Delete a row; if it was a split, nudge each leg's category so YNAB recomputes its month.
     /// The delete's error is returned; nudge failures are logged and reported, never fatal.
+    /// Does not touch the month cache: the calling tool invalidates once, after its last write.
     pub(crate) async fn delete_with_recompute(
         &self,
         t: &Transaction,
@@ -549,11 +550,10 @@ impl YnabServer {
         let Some(month) = month_of(&t.date) else {
             tracing::error!(
                 date = %t.date,
-                "deleted a row whose date does not parse; cache not dropped, legs not nudged"
+                "deleted a row whose date does not parse; its legs were not nudged"
             );
             return Ok(Vec::new());
         };
-        self.invalidate_months(std::slice::from_ref(&month)).await;
         let categories = leg_categories(t);
         if categories.is_empty() {
             return Ok(Vec::new());
@@ -714,9 +714,6 @@ impl YnabServer {
         };
 
         // 2. Delete the original. A failure here leaves both rows; say so loudly.
-        if let Some(month) = month_of(&original.date) {
-            self.invalidate_months(&[month]).await;
-        }
         let (delete_error, nudges) = match self.delete_with_recompute(&original).await {
             Ok(nudges) => (None, nudges),
             Err(e) => {
@@ -724,6 +721,9 @@ impl YnabServer {
                 (Some(e), Vec::new())
             }
         };
+        // The create landed either way, so the cache is stale either way.
+        let touched: Vec<String> = month_of(&original.date).into_iter().collect();
+        let dropped = self.invalidate_cache_from(&touched).await;
         let record = ReplaceRecord {
             batch_id: journal::new_batch_id(),
             at: journal::now(),
@@ -768,12 +768,13 @@ impl YnabServer {
             "amount": to_decimal(original.amount),
             "replacement": snapshot_json(&record.replacement),
             "recompute_nudges": nudges,
+            "months_dropped_from_cache": dropped,
             "undo_with": "undo_batch or undo_last",
         }))
     }
 
     #[tool(
-        description = "WRITE. Assign money between Ready to Assign and categories, per month. Each amount is a DELTA on the category's assigned amount (positive assigns, negative returns to Ready to Assign). Two-phase: preview shows assigned before/after per change and Ready to Assign before/after per month; confirm=true applies; a month whose Ready to Assign would go negative also needs force. Touched months are dropped from the month cache."
+        description = "WRITE. Assign money between Ready to Assign and categories, per month. Each amount is a DELTA on the category's assigned amount (positive assigns, negative returns to Ready to Assign). Two-phase: preview shows assigned before/after per change and Ready to Assign before/after per month; confirm=true applies; a month whose Ready to Assign would go negative also needs force. The earliest touched month and every later one are dropped from the month cache, since balances carry forward."
     )]
     async fn assign_money(
         &self,
@@ -865,7 +866,7 @@ impl YnabServer {
             }
         }
         let touched: Vec<String> = done.iter().map(|op| op.month.clone()).collect();
-        let invalidated = self.invalidate_months(&touched).await;
+        let invalidated = self.invalidate_cache_from(&touched).await;
 
         let mut batch_id = None;
         if !done.is_empty() {
@@ -1050,6 +1051,13 @@ impl YnabServer {
                 Err(e) => recreate_error = Some(e.to_string()),
             }
         }
+        let wrote = !undo.deleted.is_empty() || undo.recreated_transaction_id.is_some();
+        let touched: Vec<String> = if wrote {
+            month_of(&record.original.date).into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let dropped = self.invalidate_cache_from(&touched).await;
         locked
             .append(&Record::Undo(undo.clone()))
             .map_err(journal_error)?;
@@ -1074,6 +1082,7 @@ impl YnabServer {
             "skipped": undo.skipped,
             "recreated_transaction_id": undo.recreated_transaction_id,
             "recompute_nudges": nudges,
+            "months_dropped_from_cache": dropped,
             "status": if open { "partially_undone" } else { "undone" },
         }))
     }
@@ -1171,7 +1180,7 @@ impl YnabServer {
             }
         }
         let touched: Vec<String> = undo.reverted.iter().map(|k| k.month.clone()).collect();
-        let invalidated = self.invalidate_months(&touched).await;
+        let invalidated = self.invalidate_cache_from(&touched).await;
         locked
             .append(&Record::Undo(undo.clone()))
             .map_err(journal_error)?;
