@@ -142,6 +142,11 @@ fn parse_bank_date(raw: &str, format: Option<&str>) -> Result<NaiveDate, String>
 struct ParsedFile {
     path: PathBuf,
     rows: Vec<BankRow>,
+    /// Lowercased raw descriptions, parallel to `rows`. Dedupe uses this so two different
+    /// account numbers that scrub to the same `<acct>` text are not collapsed into one row.
+    /// Never returned to the caller.
+    dedupe_keys: Vec<String>,
+    scrubbed_digit_runs: usize,
 }
 
 fn read_bank_file(path: &Path, mapping: &ColumnMapping) -> Result<ParsedFile, McpError> {
@@ -187,6 +192,8 @@ fn read_bank_file(path: &Path, mapping: &ColumnMapping) -> Result<ParsedFile, Mc
         }
     };
     let mut rows = Vec::with_capacity(body.len());
+    let mut dedupe_keys = Vec::with_capacity(body.len());
+    let mut scrubbed_digit_runs = 0usize;
     for (n, r) in body.iter().enumerate() {
         let line = n + 2;
         if r.iter().all(|f| f.trim().is_empty()) {
@@ -227,15 +234,19 @@ fn read_bank_file(path: &Path, mapping: &ColumnMapping) -> Result<ParsedFile, Mc
                 credit.abs() - debit.abs()
             }
         };
+        let raw = get(desc_i).trim().to_string();
+        dedupe_keys.push(raw.to_ascii_lowercase());
         rows.push(BankRow {
             date,
             amount,
-            description: get(desc_i).trim().to_string(),
+            description: crate::statement::scrub(&raw, &mut scrubbed_digit_runs),
         });
     }
     Ok(ParsedFile {
         path: path.to_path_buf(),
         rows,
+        dedupe_keys,
+        scrubbed_digit_runs,
     })
 }
 
@@ -258,7 +269,7 @@ pub struct PdfToCsvArgs {
 #[tool_router(router = transfer_router, vis = "pub")]
 impl YnabServer {
     #[tool(
-        description = "Convert a bank statement PDF into a CSV of date, description, amount, entirely on this machine: the PDF text (account numbers, addresses) is parsed and discarded, descriptions are scrubbed of 8+ digit runs, and only the rows and a 3-row sample come back. Then use import_bank_csv with mapping {date: Date, description: Description, amount: Amount}."
+        description = "Convert a bank statement PDF into a CSV of date, description, amount, entirely on this machine: the PDF text (account numbers, addresses) is parsed and discarded, descriptions are scrubbed of account numbers (8+ digits, including numbers split by spaces or dashes; a date is left as a date), and only the rows and a 3-row sample come back. Then use import_bank_csv with mapping {date: Date, description: Description, amount: Amount}."
     )]
     async fn pdf_to_csv(
         &self,
@@ -456,7 +467,7 @@ impl YnabServer {
     }
 
     #[tool(
-        description = "Import one or more bank CSV files (same bank format) for one account: parse with the given column mapping, dedupe overlapping files, reconcile against YNAB, and report matched / missing / in-YNAB-only. With confirm=true (writes enabled) the missing rows are created: unapproved, journaled, undoable. Read the file header first and pass the mapping; nothing is guessed."
+        description = "Import one or more bank CSV files (same bank format) for one account: parse with the given column mapping, scrub account numbers out of descriptions, dedupe overlapping files, reconcile against YNAB, and report matched / missing / in-YNAB-only. With confirm=true (writes enabled) the missing rows are created: unapproved, journaled, undoable. Read the file header first and pass the mapping; nothing is guessed. Account numbers (8+ digits, including numbers split by spaces or dashes) are replaced with <acct> before a description is shown or written as a payee. A date is left as a date."
     )]
     async fn import_bank_csv(
         &self,
@@ -484,9 +495,10 @@ impl YnabServer {
         let mut seen: BTreeSet<(NaiveDate, Milliunits, String)> = BTreeSet::new();
         let mut rows: Vec<BankRow> = Vec::new();
         let mut duplicates: Vec<serde_json::Value> = Vec::new();
+        let scrubbed_digit_runs: usize = files.iter().map(|f| f.scrubbed_digit_runs).sum();
         for f in &files {
-            for r in &f.rows {
-                let key = (r.date, r.amount, r.description.to_ascii_lowercase());
+            for (r, key) in f.rows.iter().zip(f.dedupe_keys.iter()) {
+                let key = (r.date, r.amount, key.clone());
                 if seen.insert(key) {
                     rows.push(r.clone());
                 } else {
@@ -506,6 +518,7 @@ impl YnabServer {
             "files": per_file,
             "rows_after_dedupe": rows.len(),
             "duplicates_across_files": duplicates,
+            "scrubbed_digit_runs": scrubbed_digit_runs,
             "reconcile": outcome.summary,
         });
         if !args.confirm {
@@ -684,5 +697,34 @@ mod tests {
         let err = read_bank_file(&p, &mapping).unwrap_err();
         assert!(err.message.contains("Description"));
         assert!(err.message.contains("Memo"));
+    }
+
+    #[test]
+    fn scrubs_account_numbers_but_keeps_dates_and_distinct_rows() {
+        let p = write_temp(
+            "scrub.csv",
+            "Date,Description,Amount\n\
+             2026-09-01,Transfer to 1234-5678-901234,-10.00\n\
+             2026-09-01,Transfer to 9999-8888-777666,-10.00\n\
+             2026-09-02,Paid 2026-10-21,-1.00\n",
+        );
+        let mapping = ColumnMapping {
+            date: "Date".into(),
+            description: "Description".into(),
+            amount: Some("Amount".into()),
+            debit: None,
+            credit: None,
+            outflow_is_positive: false,
+            type_column: None,
+            outflow_values: None,
+            date_format: None,
+        };
+        let f = read_bank_file(&p, &mapping).unwrap();
+        assert_eq!(f.rows[0].description, "Transfer to <acct>");
+        assert_eq!(f.rows[1].description, "Transfer to <acct>");
+        assert_eq!(f.rows[2].description, "Paid 2026-10-21");
+        assert_eq!(f.scrubbed_digit_runs, 2);
+        assert_ne!(f.dedupe_keys[0], f.dedupe_keys[1]);
+        assert!(f.dedupe_keys[0].contains("1234-5678-901234"));
     }
 }

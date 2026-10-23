@@ -1,5 +1,5 @@
 //! Statement PDF → CSV, entirely on this machine. The PDF text is parsed and discarded;
-//! only date / description / amount rows (descriptions scrubbed of long digit runs) are
+//! only date / description / amount rows (descriptions scrubbed of account numbers) are
 //! written to the CSV and summarized back. Shared by the MCP tool and the CLI subcommand.
 
 use std::path::{Path, PathBuf};

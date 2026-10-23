@@ -477,7 +477,7 @@ impl YnabServer {
     }
 
     #[tool(
-        description = "Reconcile one account against bank rows. Deterministic: matches equal amounts within window_days, then reports bank rows missing in YNAB and YNAB rows (inside the bank date range) with no bank match."
+        description = "Reconcile one account against bank rows. Deterministic: matches equal amounts within window_days, then reports bank rows missing in YNAB and YNAB rows (inside the bank date range) with no bank match. Account numbers in descriptions (8+ digits, including numbers split by spaces or dashes) are replaced with <acct> before the rows are returned. A date is left as a date."
     )]
     async fn reconcile_account(
         &self,
@@ -487,6 +487,7 @@ impl YnabServer {
             return Err(invalid("rows is empty"));
         }
         let window_days = i64::from(args.window_days.unwrap_or(3));
+        let mut scrubbed_digit_runs = 0usize;
         let bank_rows = args
             .rows
             .iter()
@@ -495,15 +496,19 @@ impl YnabServer {
                     .map(|date| BankRow {
                         date,
                         amount: from_decimal(r.amount),
-                        description: r.description.clone(),
+                        description: crate::statement::scrub(
+                            r.description.trim(),
+                            &mut scrubbed_digit_runs,
+                        ),
                     })
                     .ok_or_else(|| invalid(format!("unparseable date: {}", r.date)))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let summary = self
+        let mut summary = self
             .reconcile_rows(&args.account_id, &bank_rows, window_days)
             .await?;
+        summary["scrubbed_digit_runs"] = json!(scrubbed_digit_runs);
         json_result(&summary)
     }
 }

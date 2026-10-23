@@ -1,9 +1,10 @@
 //! Turn the text rows of a bank statement into date / description / amount rows.
 //! Pure parsing over lines; the PDF reading lives in `pdf_text.rs`.
 //!
-//! Privacy: descriptions are scrubbed of any run of 8+ digits before they are returned,
-//! so full account numbers cannot ride along on a payee string. Section headers, which carry
-//! the account number, never leave this module except as a name and last four digits.
+//! Privacy: descriptions are scrubbed of account numbers before they are returned, so a full
+//! number cannot ride along on a payee string. A run of 8 or more digits counts, including a
+//! run split by spaces or dashes. A run that is only a date is left alone. Section headers,
+//! which carry the account number, never leave this module except as a name and last four digits.
 
 use chrono::NaiveDate;
 use serde::Serialize;
@@ -33,7 +34,7 @@ pub struct Parsed {
     pub sections: Vec<Section>,
     /// Lines that started with a date but could not be parsed into a row.
     pub unparsed_dated_lines: usize,
-    /// Digit runs of 8+ that were scrubbed from descriptions.
+    /// Account-number runs that were scrubbed from descriptions.
     pub scrubbed_digit_runs: usize,
 }
 
@@ -130,27 +131,80 @@ fn find_period(lines: &[String]) -> Option<(NaiveDate, NaiveDate)> {
     None
 }
 
-fn scrub(description: &str, scrubbed: &mut usize) -> String {
+fn is_digit_separator(c: char) -> bool {
+    matches!(c, ' ' | '\u{a0}' | '-' | '–' | '—')
+}
+
+/// True when the groups are a real calendar date, `YYYY-MM-DD` or `MM-DD-YYYY`.
+fn is_date(groups: &[String]) -> bool {
+    if groups.len() != 3 {
+        return false;
+    }
+    let Ok(a) = groups[0].parse::<i32>() else {
+        return false;
+    };
+    let Ok(b) = groups[1].parse::<u32>() else {
+        return false;
+    };
+    let Ok(c) = groups[2].parse::<i32>() else {
+        return false;
+    };
+    let ymd = NaiveDate::from_ymd_opt(a, b, c as u32);
+    let mdy = NaiveDate::from_ymd_opt(c, a as u32, b);
+    ymd.is_some() || mdy.is_some()
+}
+
+/// Replace account numbers with `<acct>`. Digits split only by spaces or dashes count as one
+/// number. A date-shaped run is kept, so `2026-10-21` survives.
+pub(crate) fn scrub(description: &str, scrubbed: &mut usize) -> String {
+    let chars: Vec<(usize, char)> = description.char_indices().collect();
     let mut out = String::with_capacity(description.len());
-    let mut run = String::new();
-    let flush = |run: &mut String, out: &mut String, scrubbed: &mut usize| {
-        if run.len() >= 8 {
+    let mut i = 0;
+    while i < chars.len() {
+        let (start_byte, c) = chars[i];
+        if !c.is_ascii_digit() {
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        let mut groups = Vec::new();
+        let mut current = String::new();
+        let mut j = i;
+        let mut end_byte = start_byte;
+        while j < chars.len() {
+            let ch = chars[j].1;
+            if ch.is_ascii_digit() {
+                current.push(ch);
+                end_byte = chars[j].0 + ch.len_utf8();
+                j += 1;
+                continue;
+            }
+            if is_digit_separator(ch) {
+                let mut k = j;
+                while k < chars.len() && is_digit_separator(chars[k].1) {
+                    k += 1;
+                }
+                if k < chars.len() && chars[k].1.is_ascii_digit() && !current.is_empty() {
+                    groups.push(std::mem::take(&mut current));
+                    j = k;
+                    continue;
+                }
+            }
+            break;
+        }
+        if !current.is_empty() {
+            groups.push(current);
+        }
+        let span = &description[start_byte..end_byte];
+        let digits: usize = groups.iter().map(String::len).sum();
+        if digits >= 8 && !is_date(&groups) {
             out.push_str("<acct>");
             *scrubbed += 1;
         } else {
-            out.push_str(run);
+            out.push_str(span);
         }
-        run.clear();
-    };
-    for c in description.chars() {
-        if c.is_ascii_digit() {
-            run.push(c);
-        } else {
-            flush(&mut run, &mut out, scrubbed);
-            out.push(c);
-        }
+        i = j;
     }
-    flush(&mut run, &mut out, scrubbed);
     out
 }
 
@@ -517,6 +571,29 @@ Aug 31 Monthly Interest Paid Credit + $0.76 $26,467.60
             "Transfer to account <acct>"
         );
         assert_eq!(p.scrubbed_digit_runs, 1);
+    }
+
+    #[test]
+    fn scrub_joins_digits_across_spaces_and_dashes_but_keeps_dates() {
+        let mut n = 0;
+        assert_eq!(
+            scrub("Transfer to 1234-5678-901234", &mut n),
+            "Transfer to <acct>"
+        );
+        assert_eq!(scrub("acct 1234 5678 9012", &mut n), "acct <acct>");
+        assert_eq!(
+            scrub("wire 1234 - 5678 - 901234 done", &mut n),
+            "wire <acct> done"
+        );
+        assert_eq!(n, 3);
+        let mut dates = 0;
+        assert_eq!(scrub("Paid 2026-10-21", &mut dates), "Paid 2026-10-21");
+        assert_eq!(scrub("Paid 10-21-2026", &mut dates), "Paid 10-21-2026");
+        assert_eq!(
+            scrub("total 1,234,567.89", &mut dates),
+            "total 1,234,567.89"
+        );
+        assert_eq!(dates, 0);
     }
 
     #[test]
