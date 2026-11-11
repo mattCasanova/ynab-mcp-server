@@ -974,7 +974,11 @@ impl YnabServer {
         };
         let flagged = matches!(
             check,
-            Some(RowState::Reconciled | RowState::ChangedSinceCreated { .. })
+            Some(
+                RowState::Reconciled
+                    | RowState::OtherSideReconciled { .. }
+                    | RowState::ChangedSinceCreated { .. }
+            )
         );
         let will_restore = !state.original_restored;
 
@@ -1002,7 +1006,11 @@ impl YnabServer {
         let deletable = match &check {
             None | Some(RowState::Missing { .. }) => false,
             Some(RowState::Deletable) => true,
-            Some(RowState::Reconciled | RowState::ChangedSinceCreated { .. }) => force,
+            Some(
+                RowState::Reconciled
+                | RowState::OtherSideReconciled { .. }
+                | RowState::ChangedSinceCreated { .. },
+            ) => force,
         };
         match (&check, current) {
             (None, _) => {}
@@ -1225,6 +1233,7 @@ mod tests {
             category_id: Some("split".to_string()),
             category_name: Some("Split".to_string()),
             transfer_account_id: None,
+            transfer_transaction_id: None,
             import_id: Some("YNAB:1553000:2026-07-27:1".to_string()),
             deleted: false,
             subtransactions: vec![],

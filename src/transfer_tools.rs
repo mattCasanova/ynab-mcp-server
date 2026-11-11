@@ -543,6 +543,7 @@ impl YnabServer {
                 date: r.date.to_string(),
                 amount: r.amount as f64 / 1000.0,
                 payee_name: Some(r.description.clone()),
+                transfer_account_id: None,
                 category_id: args.category_id.clone(),
                 memo: None,
                 subtransactions: None,

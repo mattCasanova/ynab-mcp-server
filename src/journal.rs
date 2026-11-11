@@ -28,6 +28,15 @@ pub struct Op {
     pub amount: Milliunits,
     pub payee_name: Option<String>,
     pub import_id: Option<String>,
+    /// The three below are set only on a transfer. Absent on lines written before transfers
+    /// existed, so those still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payee_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_account_id: Option<String>,
+    /// The row YNAB made on the other account. Undo deletes it along with this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_transaction_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,6 +547,9 @@ mod tests {
             amount: -1000,
             payee_name: None,
             import_id: None,
+            payee_id: None,
+            transfer_account_id: None,
+            transfer_transaction_id: None,
         }
     }
 
@@ -734,6 +746,24 @@ mod tests {
         let states = fold(vec![batch, undo]);
         assert_eq!(states[0].status(), "undone");
         assert_eq!(states[0].tool(), "create_transactions");
+    }
+
+    #[test]
+    fn plain_op_serializes_like_before_and_a_transfer_op_round_trips() {
+        let plain = serde_json::to_string(&op("t1")).unwrap();
+        assert!(!plain.contains("payee_id"));
+        assert!(!plain.contains("transfer"));
+
+        let transfer = Op {
+            payee_id: Some("payee-checking".into()),
+            transfer_account_id: Some("checking".into()),
+            transfer_transaction_id: Some("t1-other".into()),
+            ..op("t1")
+        };
+        let back: Op = serde_json::from_str(&serde_json::to_string(&transfer).unwrap()).unwrap();
+        assert_eq!(back.payee_id.as_deref(), Some("payee-checking"));
+        assert_eq!(back.transfer_account_id.as_deref(), Some("checking"));
+        assert_eq!(back.transfer_transaction_id.as_deref(), Some("t1-other"));
     }
 
     #[test]

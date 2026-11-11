@@ -268,14 +268,68 @@ pub struct NewTransactionArg {
     pub date: String,
     /// Signed decimal amount. Outflows negative.
     pub amount: f64,
-    /// Payee name; YNAB resolves or creates it.
+    /// Payee name; YNAB resolves or creates it. Must be unset on a transfer.
     pub payee_name: Option<String>,
+    /// Makes the row a transfer: the id of the other account (from list_accounts). YNAB
+    /// writes the matching row on that account with the opposite sign, so a negative amount
+    /// moves money out of account_id and into this one. Cannot be combined with payee_name
+    /// or subtransactions. Leave category_id unset unless the other account is off-budget.
+    pub transfer_account_id: Option<String>,
     /// Category id from list_categories. Leave unset to land uncategorized. Must be unset
     /// when subtransactions is given.
     pub category_id: Option<String>,
     pub memo: Option<String>,
     /// Split lines (2 or more) that sum exactly to amount. Each carries its own category.
     pub subtransactions: Option<Vec<SplitLineArg>>,
+}
+
+/// Ids YNAB says it created that no journaled op accounts for. A transfer's other side
+/// counts as accounted for: undoing its op deletes it. Duplicates are ignored.
+fn uncovered_ids(transaction_ids: &[String], ops: &[Op]) -> Vec<String> {
+    let covered: std::collections::HashSet<&str> = ops
+        .iter()
+        .flat_map(|op| {
+            std::iter::once(op.transaction_id.as_str()).chain(op.transfer_transaction_id.as_deref())
+        })
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    transaction_ids
+        .iter()
+        .filter(|id| !covered.contains(id.as_str()) && seen.insert(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// The payee id that turns `row` into a transfer to `to`, or why it cannot be one.
+fn transfer_payee_id(
+    accounts: &[ynab::Account],
+    row: &NewTransactionArg,
+    to: &str,
+) -> Result<String, String> {
+    if row.payee_name.is_some() {
+        return Err(
+            "payee_name must be unset on a transfer; the other account is the payee".into(),
+        );
+    }
+    if row.subtransactions.is_some() {
+        return Err("a transfer cannot be split".into());
+    }
+    if to == row.account_id {
+        return Err("transfer_account_id is the same account as account_id".into());
+    }
+    let account = accounts
+        .iter()
+        .find(|a| a.id == to && !a.deleted)
+        .ok_or_else(|| format!("transfer_account_id {to} is not an account in this plan"))?;
+    if account.closed {
+        return Err(format!("account {} is closed", account.name));
+    }
+    account.transfer_payee_id.clone().ok_or_else(|| {
+        format!(
+            "YNAB returned no transfer payee for account {}",
+            account.name
+        )
+    })
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -676,7 +730,7 @@ impl YnabServer {
     }
 
     #[tool(
-        description = "WRITE. Create transactions in bulk, single-category or split (subtransactions that sum to amount). Each gets an import_id (YNAB:amount:date:n) so re-running never double-enters, and lands unapproved for review in YNAB."
+        description = "WRITE. Create transactions in bulk: single-category, split (subtransactions that sum to amount), or a transfer between two accounts (transfer_account_id; YNAB writes the other side). Each gets an import_id (YNAB:amount:date:n) so re-running never double-enters, and lands unapproved for review in YNAB. Undoing a transfer deletes both sides."
     )]
     async fn create_transactions(
         &self,
@@ -707,6 +761,13 @@ impl YnabServer {
         if rows.is_empty() {
             return Err(invalid("transactions is empty"));
         }
+        // A transfer is a row whose payee is the other account's transfer payee, so the
+        // accounts are needed only when a row asks for one.
+        let accounts = if rows.iter().any(|t| t.transfer_account_id.is_some()) {
+            self.client.accounts().await.map_err(api_error)?
+        } else {
+            Vec::new()
+        };
         let mut occurrences: std::collections::HashMap<(i64, String), u32> = Default::default();
         let saves: Vec<SaveTransaction> = rows
             .iter()
@@ -722,13 +783,20 @@ impl YnabServer {
                             .map_err(|e| invalid(format!("transactions[{i}]: {e}")))?,
                     ),
                 };
+                let payee_id = match &t.transfer_account_id {
+                    None => None,
+                    Some(to) => Some(
+                        transfer_payee_id(&accounts, t, to)
+                            .map_err(|e| invalid(format!("transactions[{i}]: {e}")))?,
+                    ),
+                };
                 let n = occurrences.entry((amount, t.date.clone())).or_insert(0);
                 *n += 1;
                 Ok(SaveTransaction {
                     account_id: t.account_id.clone(),
                     date: t.date.clone(),
                     amount,
-                    payee_id: None,
+                    payee_id,
                     payee_name: t.payee_name.clone(),
                     category_id: t.category_id.clone(),
                     memo: t.memo.clone(),
@@ -778,18 +846,53 @@ impl YnabServer {
                 amount: t.amount,
                 payee_name: t.payee_name.clone(),
                 import_id: t.import_id.clone(),
+                payee_id: t
+                    .transfer_account_id
+                    .as_ref()
+                    .and_then(|_| t.payee_id.clone()),
+                transfer_account_id: t.transfer_account_id.clone(),
+                transfer_transaction_id: t.transfer_transaction_id.clone(),
+            })
+            .collect();
+        // A row sent with a transfer payee must come back as a transfer. If it did not, the
+        // row exists as a plain one-sided row: say so rather than report a clean transfer.
+        let sent_transfer_payees: Vec<&str> =
+            saves.iter().filter_map(|s| s.payee_id.as_deref()).collect();
+        let not_transfers: Vec<String> = result
+            .transactions
+            .iter()
+            .filter(|t| result.transaction_ids.contains(&t.id))
+            .filter(|t| {
+                t.transfer_transaction_id.is_none()
+                    && t.payee_id
+                        .as_deref()
+                        .is_some_and(|p| sent_transfer_payees.contains(&p))
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        if !not_transfers.is_empty() {
+            tracing::error!(
+                ids = ?not_transfers,
+                "create: rows sent as transfers came back without an other side"
+            );
+        }
+        let transfers: Vec<serde_json::Value> = ops
+            .iter()
+            .filter(|op| op.transfer_transaction_id.is_some())
+            .map(|op| {
+                json!({
+                    "transaction_id": op.transaction_id,
+                    "other_side_transaction_id": op.transfer_transaction_id,
+                    "other_account_id": op.transfer_account_id,
+                })
             })
             .collect();
         // If YNAB's response shape drifts, the ids exist but we could not build undo ops for
         // them. Journal what we have, then fail loudly with every id so nothing is orphaned.
-        if ops.len() != result.transaction_ids.len() {
-            let known: Vec<String> = ops.iter().map(|o| o.transaction_id.clone()).collect();
-            let orphaned: Vec<String> = result
-                .transaction_ids
-                .iter()
-                .filter(|id| !known.contains(id))
-                .cloned()
-                .collect();
+        // Compare ids, not counts: a transfer's ids do not line up one-to-one with its rows.
+        let orphaned = uncovered_ids(&result.transaction_ids, &ops);
+        if !orphaned.is_empty() {
+            let known = ops.len();
             tracing::error!(
                 ?orphaned,
                 "created rows missing from YNAB response; undo cannot cover them"
@@ -810,9 +913,9 @@ impl YnabServer {
             }
             return Err(McpError::internal_error(
                 format!(
-                    "YNAB created {} rows but returned details for only {}; these ids are NOT undoable and must be checked by hand: {:?}",
+                    "YNAB returned {} ids but details for only {} rows; these ids are NOT undoable and must be checked by hand: {:?}",
                     result.transaction_ids.len(),
-                    known.len(),
+                    known,
                     orphaned
                 ),
                 None,
@@ -840,10 +943,12 @@ impl YnabServer {
         }
         Ok(json!({
             "batch_id": batch.batch_id,
-            "created": result.transaction_ids.len(),
-            "transaction_ids": result.transaction_ids,
+            "created": batch.ops.len(),
+            "transaction_ids": batch.ops.iter().map(|op| &op.transaction_id).collect::<Vec<_>>(),
             "skipped_duplicate_import_ids": result.duplicate_import_ids,
             "months_dropped_from_cache": dropped,
+            "transfers": transfers,
+            "sent_as_transfer_but_no_other_side": not_transfers,
             "undo_with": "undo_batch or undo_last",
         }))
     }
@@ -858,9 +963,21 @@ pub(crate) enum RowState {
         reason: String,
     },
     Reconciled,
+    /// A transfer whose row on the other account is reconciled. Deleting this row deletes
+    /// that one too, so it needs force like a reconciled row does.
+    OtherSideReconciled {
+        transaction_id: String,
+        account_id: String,
+    },
     ChangedSinceCreated {
         now: serde_json::Value,
     },
+}
+
+/// The other side of a transfer: what YNAB says now, else what the journal recorded.
+fn other_side_id(op: &Op, now: Option<&ynab::Transaction>) -> Option<String> {
+    now.and_then(|t| t.transfer_transaction_id.clone())
+        .or_else(|| op.transfer_transaction_id.clone())
 }
 
 struct UndoPlan<'a> {
@@ -912,7 +1029,7 @@ impl YnabServer {
             }
         }
 
-        let rows = state
+        let mut rows: Vec<(&Op, RowState)> = state
             .remaining
             .iter()
             .map(|op| {
@@ -944,6 +1061,32 @@ impl YnabServer {
                 (op, row_state)
             })
             .collect();
+        // Deleting one side of a transfer deletes the other, which lives on an account the
+        // loop above did not read. Look at it before calling the row deletable.
+        for (op, row_state) in rows.iter_mut() {
+            if !matches!(row_state, RowState::Deletable) {
+                continue;
+            }
+            let Some(other_id) = other_side_id(op, current.get(&op.transaction_id)) else {
+                continue;
+            };
+            match self.client.transaction(&other_id).await {
+                Ok(other) if !other.deleted && other.cleared == "reconciled" => {
+                    *row_state = RowState::OtherSideReconciled {
+                        transaction_id: other_id,
+                        account_id: other.account_id,
+                    };
+                }
+                Ok(_) => {}
+                Err(YnabError::Api { status: 404, .. }) => {
+                    tracing::warn!(
+                        other_id,
+                        "undo: transfer's other side not found in YNAB; deleting this side only"
+                    );
+                }
+                Err(e) => return Err(api_error(e)),
+            }
+        }
         Ok(UndoPlan {
             batch: state,
             rows,
@@ -996,7 +1139,12 @@ impl YnabServer {
             .rows
             .iter()
             .map(
-                |(op, s)| json!({ "transaction": op, "amount": to_decimal(op.amount), "check": s }),
+                |(op, s)| json!({
+                    "transaction": op,
+                    "amount": to_decimal(op.amount),
+                    "check": s,
+                    "also_deletes_transfer_side": other_side_id(op, plan.current.get(&op.transaction_id)),
+                }),
             )
             .collect();
 
@@ -1028,7 +1176,9 @@ impl YnabServer {
             let id = op.transaction_id.clone();
             let delete = match row_state {
                 RowState::Deletable => true,
-                RowState::Reconciled | RowState::ChangedSinceCreated { .. } => force,
+                RowState::Reconciled
+                | RowState::OtherSideReconciled { .. }
+                | RowState::ChangedSinceCreated { .. } => force,
                 RowState::Missing { reason } => {
                     undo.missing.push(id.clone());
                     tracing::warn!(id, reason, "undo: row already gone; recording as resolved");
@@ -1074,10 +1224,17 @@ impl YnabServer {
             .append(&Record::Undo(undo.clone()))
             .map_err(journal_error)?;
         let remaining = plan.rows.len() - undo.deleted.len() - undo.missing.len();
+        let transfer_sides: Vec<String> = plan
+            .rows
+            .iter()
+            .filter(|(op, _)| undo.deleted.contains(&op.transaction_id))
+            .filter_map(|(op, _)| other_side_id(op, plan.current.get(&op.transaction_id)))
+            .collect();
         json_result(&json!({
             "batch_id": undo.batch_id,
             "kind": "batch",
             "deleted": undo.deleted,
+            "transfer_sides_deleted_with_them": transfer_sides,
             "missing_already_gone": undo.missing,
             "skipped": undo.skipped,
             "remaining_in_batch": remaining,
@@ -1110,6 +1267,7 @@ fn write_json(w: &WriteState) -> serde_json::Value {
                     "amount": to_decimal(op.amount),
                     "payee": op.payee_name,
                     "account_id": op.account_id,
+                    "transfer_account_id": op.transfer_account_id,
                     "undone": !b.remaining.iter().any(|r| r.transaction_id == op.transaction_id),
                 })).collect::<Vec<_>>(),
             })
@@ -1213,7 +1371,7 @@ fn ynab_row_json(r: &YnabRow) -> serde_json::Value {
 impl ServerHandler for YnabServer {
     fn get_info(&self) -> ServerInfo {
         let mode = if self.allow_writes {
-            "Writes are ENABLED: create_transactions (single or split) lands rows unapproved, replace_transaction reshapes a row at the same total, assign_money moves money by month; every write is journaled and undo_batch / undo_last reverse them. Preview first (confirm=false), show the user, then confirm."
+            "Writes are ENABLED: create_transactions (single, split, or a transfer between accounts via transfer_account_id) lands rows unapproved, replace_transaction reshapes a row at the same total, assign_money moves money by month; every write is journaled and undo_batch / undo_last reverse them. Preview first (confirm=false), show the user, then confirm."
         } else {
             "Read-only: no tool can change the plan."
         };
@@ -1245,5 +1403,141 @@ mod tests {
         );
         assert_eq!(earliest_month(&[]), None);
         assert_eq!(earliest_month(&["junk".to_string()]), None);
+    }
+
+    fn account(id: &str, transfer_payee_id: Option<&str>) -> ynab::Account {
+        ynab::Account {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: "checking".to_string(),
+            on_budget: true,
+            closed: false,
+            note: None,
+            balance: 0,
+            cleared_balance: 0,
+            uncleared_balance: 0,
+            last_reconciled_at: None,
+            transfer_payee_id: transfer_payee_id.map(str::to_string),
+            deleted: false,
+        }
+    }
+
+    fn transfer_row(from: &str) -> NewTransactionArg {
+        NewTransactionArg {
+            account_id: from.to_string(),
+            date: "2026-10-16".to_string(),
+            amount: -427.89,
+            payee_name: None,
+            transfer_account_id: Some("checking".to_string()),
+            category_id: None,
+            memo: None,
+            subtransactions: None,
+        }
+    }
+
+    #[test]
+    fn transfer_resolves_to_the_other_accounts_transfer_payee() {
+        let accounts = vec![
+            account("card", Some("p-card")),
+            account("checking", Some("p-chk")),
+        ];
+        assert_eq!(
+            transfer_payee_id(&accounts, &transfer_row("card"), "checking"),
+            Ok("p-chk".to_string())
+        );
+    }
+
+    #[test]
+    fn transfer_refuses_what_cannot_be_a_transfer() {
+        let accounts = vec![
+            account("card", Some("p-card")),
+            account("checking", Some("p-chk")),
+        ];
+        let err = |row: &NewTransactionArg, to: &str, accounts: &[ynab::Account]| {
+            transfer_payee_id(accounts, row, to).unwrap_err()
+        };
+
+        let mut named = transfer_row("card");
+        named.payee_name = Some("Nord".into());
+        assert!(err(&named, "checking", &accounts).contains("payee_name"));
+
+        let mut split = transfer_row("card");
+        split.subtransactions = Some(vec![]);
+        assert!(err(&split, "checking", &accounts).contains("split"));
+
+        assert!(err(&transfer_row("checking"), "checking", &accounts).contains("same account"));
+        assert!(err(&transfer_row("card"), "nope", &accounts).contains("not an account"));
+
+        let mut closed = account("checking", Some("p-chk"));
+        closed.closed = true;
+        let with_closed = vec![account("card", Some("p-card")), closed];
+        assert!(err(&transfer_row("card"), "checking", &with_closed).contains("closed"));
+
+        let mut deleted = account("checking", Some("p-chk"));
+        deleted.deleted = true;
+        let with_deleted = vec![account("card", Some("p-card")), deleted];
+        assert!(err(&transfer_row("card"), "checking", &with_deleted).contains("not an account"));
+
+        let no_payee = vec![account("card", Some("p-card")), account("checking", None)];
+        assert!(err(&transfer_row("card"), "checking", &no_payee).contains("no transfer payee"));
+    }
+
+    fn transfer_op(id: &str, other: Option<&str>) -> Op {
+        Op {
+            transaction_id: id.into(),
+            account_id: "card".into(),
+            date: "2026-10-16".into(),
+            amount: -427_890,
+            payee_name: None,
+            import_id: None,
+            payee_id: other.map(|_| "p-chk".into()),
+            transfer_account_id: other.map(|_| "checking".into()),
+            transfer_transaction_id: other.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn transfer_ids_are_covered_whether_ynab_repeats_them_or_lists_the_other_side() {
+        let ops = vec![transfer_op("a", Some("b"))];
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(uncovered_ids(&ids(&["a", "a"]), &ops).is_empty());
+        assert!(uncovered_ids(&ids(&["a", "b"]), &ops).is_empty());
+        assert!(uncovered_ids(&ids(&["b", "a"]), &ops).is_empty());
+    }
+
+    #[test]
+    fn ids_with_no_op_are_reported_once() {
+        let ops = vec![transfer_op("a", None)];
+        let ids: Vec<String> = ["a", "x", "x", "y"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            uncovered_ids(&ids, &ops),
+            vec!["x".to_string(), "y".to_string()]
+        );
+        assert_eq!(
+            uncovered_ids(&ids, &[]),
+            vec!["a".to_string(), "x".to_string(), "y".to_string()]
+        );
+    }
+
+    #[test]
+    fn other_side_prefers_what_ynab_says_now_over_the_journal() {
+        let op = Op {
+            transaction_id: "t1".into(),
+            account_id: "card".into(),
+            date: "2026-10-16".into(),
+            amount: -427_890,
+            payee_name: None,
+            import_id: None,
+            payee_id: Some("p-chk".into()),
+            transfer_account_id: Some("checking".into()),
+            transfer_transaction_id: Some("journaled".into()),
+        };
+        assert_eq!(other_side_id(&op, None).as_deref(), Some("journaled"));
+
+        let plain = Op {
+            transfer_transaction_id: None,
+            ..op.clone()
+        };
+        assert_eq!(other_side_id(&plain, None), None);
     }
 }

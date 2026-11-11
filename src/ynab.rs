@@ -73,6 +73,9 @@ pub struct Account {
     pub cleared_balance: Milliunits,
     pub uncleared_balance: Milliunits,
     pub last_reconciled_at: Option<String>,
+    /// The payee that makes a transaction a transfer to or from this account.
+    #[serde(default)]
+    pub transfer_payee_id: Option<String>,
     pub deleted: bool,
 }
 
@@ -180,6 +183,9 @@ pub struct Transaction {
     pub category_id: Option<String>,
     pub category_name: Option<String>,
     pub transfer_account_id: Option<String>,
+    /// The row on the other account when this is a transfer. Deleting either side deletes both.
+    #[serde(default)]
+    pub transfer_transaction_id: Option<String>,
     pub import_id: Option<String>,
     pub deleted: bool,
     #[serde(default)]

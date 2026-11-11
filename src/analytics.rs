@@ -346,6 +346,7 @@ mod tests {
             category_id: Some(format!("cat-{category}")),
             category_name: Some(category.to_string()),
             transfer_account_id: None,
+            transfer_transaction_id: None,
             import_id: None,
             deleted: false,
             subtransactions: vec![],

@@ -83,7 +83,7 @@ Write tools, registered only when writes are on:
 
 | Tool | What it does |
 |---|---|
-| `create_transactions` | single-category or split rows; deduped by import id, land unapproved |
+| `create_transactions` | single-category rows, split rows, or transfers between accounts; deduped by import id, land unapproved |
 | `replace_transaction` | recategorize or re-split one row at the same account, date, payee, and total |
 | `assign_money` | per-month changes to categories' assigned amounts |
 | `trigger_bank_import` | YNAB's Import button for linked accounts; bank rows, so not journaled |
@@ -92,6 +92,10 @@ Write tools, registered only when writes are on:
 Create, replace, assign, and undo run in two phases: call without `confirm` for a preview,
 then with `confirm=true` to apply. Rows that changed since they were written, or are reconciled, are
 skipped on undo unless you pass `force=true`.
+
+A transfer is a row with `transfer_account_id` set to the other account. YNAB writes the
+matching row there. The journal records both sides, and undo deletes both; if the other side
+has been reconciled, undo skips the transfer unless you pass `force=true`.
 
 ## Privacy
 
